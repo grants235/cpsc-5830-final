@@ -1,0 +1,49 @@
+python: /Users/grantshanklin/Documents/cpsc-5830/.venv/bin/python3
+
+datasets:
+  - lycos_ids2017
+  - cic_ids2018
+  - unsw_nb15
+  - ton_iot
+
+lodo_folds:
+  fold_0:
+    train: [cic_ids2018, unsw_nb15, ton_iot]
+    test:  lycos_ids2017
+  fold_1:
+    train: [lycos_ids2017, unsw_nb15, ton_iot]
+    test:  cic_ids2018
+  fold_2:
+    train: [lycos_ids2017, cic_ids2018, ton_iot]
+    test:  unsw_nb15
+  fold_3:
+    train: [lycos_ids2017, cic_ids2018, unsw_nb15]
+    test:  ton_iot
+
+seeds: [0, 1, 2]
+dev: true          # set false for final full-data run
+
+model:
+  hidden: 128
+  dropout: 0.2
+  num_classes: 2
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  epochs: 30
+  patience: 5
+  batch_size: 4096
+  use_quantile: true
+
+tgn:
+  memory_dim: 100
+  time_dim: 100
+  embed_dim: 100
+  batch_size: 200
+
+moe:
+  K: 3
+  lam: 0.1
+
+device: cpu   # change to "cuda" if GPU available
