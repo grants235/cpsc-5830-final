@@ -60,6 +60,17 @@ def _run_standard(exp_id, tier, use_quantile, dev, structure_only=False):
             combined     = combine_graphs(train_graphs)
             test_graph   = load_graph(test_dset, tier=tier, dev=dev)
 
+            # Align test graph feature dim to combined training dim
+            max_feat = combined.edge_attr.shape[1]
+            d = test_graph.edge_attr.shape[1]
+            if d < max_feat:
+                pad = torch.zeros(test_graph.edge_attr.shape[0], max_feat - d)
+                test_graph.edge_attr   = torch.cat([test_graph.edge_attr, pad], dim=1)
+                test_graph.edge_attr_q = torch.cat([test_graph.edge_attr_q, pad], dim=1)
+            elif d > max_feat:
+                test_graph.edge_attr   = test_graph.edge_attr[:, :max_feat]
+                test_graph.edge_attr_q = test_graph.edge_attr_q[:, :max_feat]
+
             if structure_only:
                 # Mask all edge features to 1.0
                 combined.edge_attr   = torch.ones_like(combined.edge_attr)

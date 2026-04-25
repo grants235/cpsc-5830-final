@@ -62,11 +62,14 @@ def _run_moe(exp_id: str, dev: bool, uniform_gate: bool = False, no_align: bool 
             test_graph   = load_graph(test_dset, tier="B", dev=dev)
 
             max_feat = combined.edge_attr.shape[1]
-            if test_graph.edge_attr.shape[1] < max_feat:
-                pad = torch.zeros(test_graph.edge_attr.shape[0],
-                                  max_feat - test_graph.edge_attr.shape[1])
+            d = test_graph.edge_attr.shape[1]
+            if d < max_feat:
+                pad = torch.zeros(test_graph.edge_attr.shape[0], max_feat - d)
                 test_graph.edge_attr   = torch.cat([test_graph.edge_attr, pad], dim=1)
                 test_graph.edge_attr_q = torch.cat([test_graph.edge_attr_q, pad], dim=1)
+            elif d > max_feat:
+                test_graph.edge_attr   = test_graph.edge_attr[:, :max_feat]
+                test_graph.edge_attr_q = test_graph.edge_attr_q[:, :max_feat]
 
             n = combined.edge_label.shape[0]
             ti, vi = _tts(np.arange(n), test_size=0.2, random_state=seed,
