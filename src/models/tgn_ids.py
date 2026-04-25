@@ -56,17 +56,22 @@ class TGN_IDS(nn.Module):
         )
         self.num_nodes = num_nodes
 
-    def forward(self, src, dst, t, msg, neighbor_loader, assoc):
+    def forward(self, src, dst, t, msg, neighbor_loader, assoc,
+                t_full=None, msg_full=None):
         n_id = torch.cat([src, dst]).unique()
         n_id_sampled, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id_sampled] = torch.arange(
             n_id_sampled.size(0), device=src.device
         )
         z, last_update = self.memory(n_id_sampled)
+        # e_id is a global epoch-level index from LastNeighborLoader; must index
+        # into the full epoch arrays, not the current batch slice.
+        _t   = t_full   if t_full   is not None else t
+        _msg = msg_full if msg_full is not None else msg
         z = self.gnn(
             z, last_update, edge_index,
-            t[e_id] if e_id.numel() > 0 else t[:0],
-            msg[e_id] if e_id.numel() > 0 else msg[:0],
+            _t[e_id]   if e_id.numel() > 0 else t[:0],
+            _msg[e_id] if e_id.numel() > 0 else msg[:0],
         )
         edge_feat = torch.cat([z[assoc[src]], z[assoc[dst]], msg], dim=-1)
         return self.classifier(edge_feat)

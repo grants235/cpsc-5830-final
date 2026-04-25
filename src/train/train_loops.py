@@ -162,7 +162,8 @@ def train_tgn(
                         neighbor_loader.reset_state()
 
             optimizer.zero_grad()
-            logits = model(src, dst, t, msg, neighbor_loader, assoc)
+            logits = model(src, dst, t, msg, neighbor_loader, assoc,
+                           t_full=t_all, msg_full=edge_attr)
             loss   = criterion(logits, y)
             loss.backward()
             optimizer.step()

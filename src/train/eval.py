@@ -75,7 +75,7 @@ def eval_tgn(
     edge_attr = (data.edge_attr_q if use_quantile else data.edge_attr).to(device)
     src_all   = data.edge_index[0]
     dst_all   = data.edge_index[1]
-    t_all     = data.edge_time
+    t_all     = data.edge_time.to(device)
     y_true    = data.edge_label.numpy()
 
     all_preds, all_scores = [], []
@@ -84,10 +84,11 @@ def eval_tgn(
         end   = min(start + batch_size, E)
         src   = src_all[start:end].to(device)
         dst   = dst_all[start:end].to(device)
-        t     = t_all[start:end].to(device)
+        t     = t_all[start:end]
         msg   = edge_attr[start:end]
 
-        logits = model(src, dst, t, msg, neighbor_loader, assoc)
+        logits = model(src, dst, t, msg, neighbor_loader, assoc,
+                       t_full=t_all, msg_full=edge_attr)
         probs  = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
         preds  = logits.argmax(dim=-1).cpu().numpy()
         all_preds.append(preds)
