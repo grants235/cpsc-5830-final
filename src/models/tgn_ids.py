@@ -18,25 +18,20 @@ from torch_geometric.nn.models.tgn import (
 
 def _fix_tgn_memory_dtype(memory: TGNMemory) -> None:
     """
-    PyG versions vary in whether TGNMemory.last_update is Long or Float.
-    _reset_message_store always creates timestamp placeholders as Long.
-    When last_update is Float (newer PyG), this causes a dtype error on the
-    very first update_state call.  Patch _reset_message_store to use the same
-    dtype as last_update so the two are always consistent.
+    Fix for PyG versions where TGNMemory.last_update is a Float buffer but
+    _update_memory tries to store a Long tensor into it → RuntimeError.
+    Patch _update_memory to cast last_update to the buffer's dtype before
+    the assignment.  No-op when last_update is already Long (older PyG).
     """
-    lu_dtype = memory.last_update.dtype
-    if lu_dtype == torch.long:
-        return  # old PyG with Long last_update — no mismatch
+    if memory.last_update.dtype == torch.long:
+        return
 
-    def _patched_reset(self):
-        i   = self.memory.new_empty((0,), device=self.device, dtype=torch.long)
-        t   = self.memory.new_empty((0,), device=self.device, dtype=lu_dtype)
-        msg = self.memory.new_empty((0, self.raw_msg_dim), device=self.device)
-        self.msg_s_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
-        self.msg_d_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
+    def _patched_update_memory(self, n_id):
+        mem, last_update = self._get_updated_memory(n_id)
+        self.memory[n_id] = mem
+        self.last_update[n_id] = last_update.to(self.last_update.dtype)
 
-    memory._reset_message_store = types.MethodType(_patched_reset, memory)
-    memory.reset_state()  # re-initialize with correct-dtype timestamp placeholders
+    memory._update_memory = types.MethodType(_patched_update_memory, memory)
 
 
 class GraphAttentionEmbedding(nn.Module):

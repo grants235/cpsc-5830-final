@@ -44,26 +44,20 @@ log = logging.getLogger(__name__)
 
 def _patch_tgn_memory_dtype(memory) -> None:
     """
-    Fix for PyG versions where TGNMemory.last_update is Float but
-    _reset_message_store initialises timestamp placeholders as Long.
-    On the first update_state call, scatter() returns a Long last_update
-    that can't be stored in the Float buffer → RuntimeError.
-    Patch _reset_message_store to use the same dtype as last_update.
-    Is a no-op when last_update is already Long (older PyG).
+    Fix for PyG versions where TGNMemory.last_update is a Float buffer but
+    _update_memory tries to store a Long tensor into it → RuntimeError.
+    Patch _update_memory to cast last_update to the buffer's dtype before
+    the assignment.  No-op when last_update is already Long (older PyG).
     """
-    lu_dtype = memory.last_update.dtype
-    if lu_dtype == torch.long:
+    if memory.last_update.dtype == torch.long:
         return
 
-    def _reset(self):
-        i   = self.memory.new_empty((0,), device=self.device, dtype=torch.long)
-        t   = self.memory.new_empty((0,), device=self.device, dtype=lu_dtype)
-        msg = self.memory.new_empty((0, self.raw_msg_dim), device=self.device)
-        self.msg_s_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
-        self.msg_d_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
+    def _patched_update_memory(self, n_id):
+        mem, last_update = self._get_updated_memory(n_id)
+        self.memory[n_id] = mem
+        self.last_update[n_id] = last_update.to(self.last_update.dtype)
 
-    memory._reset_message_store = types.MethodType(_reset, memory)
-    memory.reset_state()
+    memory._update_memory = types.MethodType(_patched_update_memory, memory)
 
 
 SEED = 0
