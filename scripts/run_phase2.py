@@ -22,6 +22,7 @@ import copy
 import logging
 import sys
 import time
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -39,6 +40,31 @@ from src.train.train_loops import train_egraphsage, train_tgn
 from src.train.eval import eval_egraphsage, eval_tgn
 
 log = logging.getLogger(__name__)
+
+
+def _patch_tgn_memory_dtype(memory) -> None:
+    """
+    Fix for PyG versions where TGNMemory.last_update is Float but
+    _reset_message_store initialises timestamp placeholders as Long.
+    On the first update_state call, scatter() returns a Long last_update
+    that can't be stored in the Float buffer → RuntimeError.
+    Patch _reset_message_store to use the same dtype as last_update.
+    Is a no-op when last_update is already Long (older PyG).
+    """
+    lu_dtype = memory.last_update.dtype
+    if lu_dtype == torch.long:
+        return
+
+    def _reset(self):
+        i   = self.memory.new_empty((0,), device=self.device, dtype=torch.long)
+        t   = self.memory.new_empty((0,), device=self.device, dtype=lu_dtype)
+        msg = self.memory.new_empty((0, self.raw_msg_dim), device=self.device)
+        self.msg_s_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
+        self.msg_d_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
+
+    memory._reset_message_store = types.MethodType(_reset, memory)
+    memory.reset_state()
+
 
 SEED = 0
 PHASE2_FOLDS = [
@@ -433,6 +459,7 @@ def run_q3b(dev):
         num_nodes = combined.num_nodes + test_graph.num_nodes
 
         model = TGN_IDS(num_nodes, max_feat)
+        _patch_tgn_memory_dtype(model.memory)
         best_state = train_tgn(
             model, combined, val_data=None,
             device=device, use_quantile=True,
