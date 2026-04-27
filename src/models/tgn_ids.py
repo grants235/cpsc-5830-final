@@ -3,8 +3,6 @@ TGN-IDS: Temporal Graph Network adapted for edge (flow) classification.
 Adapted from PyG examples/tgn.py — link prediction replaced with binary classifier.
 """
 
-import types
-
 import torch
 import torch.nn as nn
 from torch_geometric.nn import TransformerConv
@@ -18,20 +16,27 @@ from torch_geometric.nn.models.tgn import (
 
 def _fix_tgn_memory_dtype(memory: TGNMemory) -> None:
     """
-    Fix for PyG versions where TGNMemory.last_update is a Float buffer but
-    _update_memory tries to store a Long tensor into it → RuntimeError.
-    Patch _update_memory to cast last_update to the buffer's dtype before
-    the assignment.  No-op when last_update is already Long (older PyG).
+    Fix RuntimeError: expected scalar type Float but found Long at tgn.py:128.
+    Newer PyG (Python 3.11 env) registers last_update as a Float buffer, but
+    _get_updated_memory() returns a Long tensor → type mismatch on assignment.
+
+    Instance-level types.MethodType patching is silently bypassed by
+    nn.Module's attribute resolution, so we patch at the CLASS level instead.
+    The cast (.to(self.last_update.dtype)) is a no-op when dtypes already match,
+    so the patch is safe for older PyG builds too.
     """
     if memory.last_update.dtype == torch.long:
-        return
+        return  # old PyG — Long buffer, no mismatch
+    if getattr(TGNMemory._update_memory, '_dtype_patched', False):
+        return  # already patched this session
 
-    def _patched_update_memory(self, n_id):
+    def _fixed(self, n_id):
         mem, last_update = self._get_updated_memory(n_id)
         self.memory[n_id] = mem
         self.last_update[n_id] = last_update.to(self.last_update.dtype)
 
-    memory._update_memory = types.MethodType(_patched_update_memory, memory)
+    _fixed._dtype_patched = True
+    TGNMemory._update_memory = _fixed
 
 
 class GraphAttentionEmbedding(nn.Module):
