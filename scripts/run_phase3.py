@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 3 follow-up experiments (spex3.md).
-All 4 LODO folds, seed 0, ≤12 GPU-hours. Reuses Phase 1/2 code paths.
+Phase 3 follow-up experiments (spex3.md), excluding TGN (P3.1).
+All 4 LODO folds, seed 0. Reuses Phase 1/2 code paths.
 
 Usage:
-    python scripts/run_phase3.py --exp tgn            [--folds all|cic18|ton|lycos|unsw] [--seed 0]
     python scripts/run_phase3.py --exp per_attack      [--seed 0]
     python scripts/run_phase3.py --exp cic17_single    [--seed 0]
     python scripts/run_phase3.py --exp embed_analysis  [--models cic18 ton] [--seed 0]
@@ -26,15 +25,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split as _tts
-from torch_geometric.data import Data
 
 from src.utils.logging import setup_logging, log_result, already_done, save_model
 from src.utils.seeding import seed_everything
 from src.utils.metrics import compute_all_metrics, CLASSES
 from src.data.graph_builder import load_graph, combine_graphs
 from src.models.egraphsage import EdgeAwareSAGE
-from src.train.train_loops import train_egraphsage, train_tgn
-from src.train.eval import eval_egraphsage, eval_tgn
+from src.train.train_loops import train_egraphsage
+from src.train.eval import eval_egraphsage
 
 log = logging.getLogger(__name__)
 
@@ -89,27 +87,6 @@ def _make_val_split(combined):
     ti, vi = _tts(np.arange(n), test_size=0.2, random_state=0,
                   stratify=combined.edge_label.numpy())
     return {"train": ti.tolist(), "val": vi.tolist()}
-
-
-def _temporal_val_split(combined, val_frac=0.2):
-    """Split combined graph temporally: first (1-val_frac) for train, rest for val."""
-    n = combined.edge_index.shape[1]
-    split = int(n * (1 - val_frac))
-
-    def _slice(start, end):
-        d = Data(
-            x=combined.x,
-            edge_index=combined.edge_index[:, start:end],
-            edge_attr=combined.edge_attr[start:end],
-            edge_attr_q=combined.edge_attr_q[start:end],
-            edge_time=combined.edge_time[start:end],
-            edge_label=combined.edge_label[start:end],
-        )
-        d.edge_label_type = combined.edge_label_type[start:end]
-        d.num_nodes = combined.num_nodes
-        return d
-
-    return _slice(0, split), _slice(split, n)
 
 
 def _train_e1e(combined, device, seed=0):
@@ -188,77 +165,6 @@ def _build_scale_inv_graph(tier_a_graph):
     g.edge_attr   = new_ea
     g.edge_attr_q = new_ea_q
     return g
-
-
-# ── P3.1 — TGN cross-domain on all 4 folds ───────────────────────────────────
-
-def run_p3_1_tgn(folds_arg, seed, dev):
-    log.info("=== P3.1  TGN cross-domain (all 4 folds) ===")
-    from src.models.tgn_ids import TGN_IDS
-    from torch_geometric.nn.models.tgn import LastNeighborLoader
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if folds_arg == "all":
-        folds_to_run = ALL_FOLDS
-    else:
-        target_test = NAME_MAP.get(folds_arg, folds_arg)
-        folds_to_run = [f for f in ALL_FOLDS if f["test"] == target_test]
-
-    for fold in folds_to_run:
-        combined, test_graph, train_dsets, test_dset = _load_fold(fold, dev)
-
-        if already_done("E2.B_TGN", seed, test_dset):
-            log.info(f"  Skipping E2.B_TGN test={test_dset} (already done)")
-            continue
-
-        seed_everything(seed)
-        t0 = time.time()
-
-        max_feat  = combined.edge_attr.shape[1]
-        num_nodes = combined.num_nodes + test_graph.num_nodes
-        train_g, val_g = _temporal_val_split(combined)
-
-        model = TGN_IDS(num_nodes, max_feat)
-        best_state = train_tgn(
-            model, train_g, val_data=val_g,
-            device=device, use_quantile=True,
-            epochs=10, min_epochs=3, patience=3,
-        )
-        model.load_state_dict(best_state)
-        save_model("E2.B_TGN", seed, test_dset, best_state)
-
-        neighbor_loader = LastNeighborLoader(num_nodes, size=10, device=device)
-        assoc = torch.empty(num_nodes, dtype=torch.long, device=device)
-        result  = eval_tgn(model, test_graph, neighbor_loader, assoc,
-                           device=device, use_quantile=True)
-        metrics = compute_all_metrics(result["y_true"], result["y_pred"],
-                                      y_true_type=test_graph.edge_label_type)
-        elapsed = time.time() - t0
-
-        log_result("E2.B_TGN", seed, train_dsets, test_dset, "mcc",
-                   metrics["mcc"], elapsed)
-        log_result("E2.B_TGN", seed, train_dsets, test_dset, "macro_f1",
-                   metrics["macro_f1"], elapsed)
-        for cls, f1 in metrics.get("per_class_f1", {}).items():
-            log_result("E2.B_TGN", seed, train_dsets, test_dset,
-                       f"f1_{cls}", f1, elapsed)
-
-        log.info(f"\n  P3.1 TGN fold={test_dset}:")
-        log.info(f"    MCC      = {metrics['mcc']:.4f}")
-        log.info(f"    macro-F1 = {metrics['macro_f1']:.4f}")
-        pcf = metrics.get("per_class_f1", {})
-        for cls, f1 in pcf.items():
-            log.info(f"    F1[{cls:<22}] = {f1:.4f}")
-
-        e1e_refs = {"cic_ids2018": 0.597, "ton_iot": 0.259}
-        ref = e1e_refs.get(test_dset)
-        if ref is not None:
-            diff = metrics["mcc"] - ref
-            verdict = ("TGN wins (+{:.3f})".format(diff) if diff >= 0.05
-                       else "neutral ({:+.3f})".format(diff) if diff >= -0.05
-                       else "TGN worse ({:+.3f})".format(diff))
-            log.info(f"    vs E1.E ref {ref:.3f}: {verdict}")
 
 
 # ── P3.2 — Per-attack F1 for E1.E (all 4 folds) ─────────────────────────────
@@ -644,10 +550,10 @@ def main():
     setup_logging()
     parser = argparse.ArgumentParser(description="Phase 3 experiments (spex3.md)")
     parser.add_argument("--exp",     required=True,
-                        choices=["tgn", "per_attack", "cic17_single",
+                        choices=["per_attack", "cic17_single",
                                  "embed_analysis", "scale_invariant", "all"])
     parser.add_argument("--folds",   default="all",
-                        help="all | cic18 | ton | lycos | unsw")
+                        help="all | cic18 | ton | lycos | unsw  (used by scale_invariant)")
     parser.add_argument("--models",  nargs="+", default=["cic18", "ton"],
                         help="Fold(s) for embed_analysis: cic18 ton lycos unsw")
     parser.add_argument("--seed",    type=int, default=0)
@@ -656,9 +562,6 @@ def main():
     args = parser.parse_args()
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-
-    if args.exp == "tgn" or args.exp == "all":
-        run_p3_1_tgn(_resolve_folds(args.folds), args.seed, args.dev)
 
     if args.exp == "per_attack" or args.exp == "all":
         run_p3_2_per_attack(args.seed, args.dev)
