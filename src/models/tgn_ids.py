@@ -3,6 +3,8 @@ TGN-IDS: Temporal Graph Network adapted for edge (flow) classification.
 Adapted from PyG examples/tgn.py — link prediction replaced with binary classifier.
 """
 
+import types
+
 import torch
 import torch.nn as nn
 from torch_geometric.nn import TransformerConv
@@ -12,6 +14,29 @@ from torch_geometric.nn.models.tgn import (
     LastAggregator,
     LastNeighborLoader,
 )
+
+
+def _fix_tgn_memory_dtype(memory: TGNMemory) -> None:
+    """
+    PyG versions vary in whether TGNMemory.last_update is Long or Float.
+    _reset_message_store always creates timestamp placeholders as Long.
+    When last_update is Float (newer PyG), this causes a dtype error on the
+    very first update_state call.  Patch _reset_message_store to use the same
+    dtype as last_update so the two are always consistent.
+    """
+    lu_dtype = memory.last_update.dtype
+    if lu_dtype == torch.long:
+        return  # old PyG with Long last_update — no mismatch
+
+    def _patched_reset(self):
+        i   = self.memory.new_empty((0,), device=self.device, dtype=torch.long)
+        t   = self.memory.new_empty((0,), device=self.device, dtype=lu_dtype)
+        msg = self.memory.new_empty((0, self.raw_msg_dim), device=self.device)
+        self.msg_s_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
+        self.msg_d_store = {j: (i, i, t, msg) for j in range(self.num_nodes)}
+
+    memory._reset_message_store = types.MethodType(_patched_reset, memory)
+    memory.reset_state()  # re-initialize with correct-dtype timestamp placeholders
 
 
 class GraphAttentionEmbedding(nn.Module):
@@ -46,6 +71,7 @@ class TGN_IDS(nn.Module):
             message_module=IdentityMessage(raw_msg_dim, memory_dim, time_dim),
             aggregator_module=LastAggregator(),
         )
+        _fix_tgn_memory_dtype(self.memory)
         self.gnn = GraphAttentionEmbedding(
             memory_dim, embed_dim, raw_msg_dim, self.memory.time_enc,
         )
@@ -90,6 +116,7 @@ class TGN_MemoryOnly(nn.Module):
             message_module=IdentityMessage(raw_msg_dim, memory_dim, time_dim),
             aggregator_module=LastAggregator(),
         )
+        _fix_tgn_memory_dtype(self.memory)
         self.classifier = nn.Sequential(
             nn.Linear(2 * memory_dim + raw_msg_dim, memory_dim),
             nn.ReLU(),
