@@ -55,31 +55,6 @@ NAME_MAP = {
 FIGURES_DIR = Path("results/figures/phase3")
 
 
-# ── TGN dtype fix (same as run_phase2.py) ────────────────────────────────────
-
-def _patch_tgn_memory_dtype(memory) -> None:
-    """
-    Fix RuntimeError: expected scalar type Float but found Long at tgn.py:128.
-    Instance-level types.MethodType patching is silently bypassed by
-    nn.Module's attribute resolution, so we patch at the CLASS level instead.
-    The cast is a no-op when dtypes already match (older PyG with Long buffer).
-    """
-    from torch_geometric.nn import TGNMemory
-
-    if memory.last_update.dtype == torch.long:
-        return
-    if getattr(TGNMemory._update_memory, '_dtype_patched', False):
-        return
-
-    def _fixed(self, n_id):
-        mem, last_update = self._get_updated_memory(n_id)
-        self.memory[n_id] = mem
-        self.last_update[n_id] = last_update.to(self.last_update.dtype)
-
-    _fixed._dtype_patched = True
-    TGNMemory._update_memory = _fixed
-
-
 # ── data helpers ─────────────────────────────────────────────────────────────
 
 def _load_fold(fold, dev, structure_only=False, tier="B"):
@@ -245,8 +220,6 @@ def run_p3_1_tgn(folds_arg, seed, dev):
         train_g, val_g = _temporal_val_split(combined)
 
         model = TGN_IDS(num_nodes, max_feat)
-        _patch_tgn_memory_dtype(model.memory)
-
         best_state = train_tgn(
             model, train_g, val_data=val_g,
             device=device, use_quantile=True,

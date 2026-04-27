@@ -14,29 +14,22 @@ from torch_geometric.nn.models.tgn import (
 )
 
 
-def _fix_tgn_memory_dtype(memory: TGNMemory) -> None:
+class _SafeTGNMemory(TGNMemory):
     """
-    Fix RuntimeError: expected scalar type Float but found Long at tgn.py:128.
-    Newer PyG (Python 3.11 env) registers last_update as a Float buffer, but
-    _get_updated_memory() returns a Long tensor → type mismatch on assignment.
+    TGNMemory subclass that casts last_update to match the buffer dtype before
+    assignment.  Required for newer PyG builds (Python 3.11 cluster) where
+    last_update is registered as a Float buffer but _get_updated_memory()
+    returns a Long tensor → RuntimeError at the original assignment line.
 
-    Instance-level types.MethodType patching is silently bypassed by
-    nn.Module's attribute resolution, so we patch at the CLASS level instead.
-    The cast (.to(self.last_update.dtype)) is a no-op when dtypes already match,
-    so the patch is safe for older PyG builds too.
+    Using a subclass is the only reliable fix: instance- and class-level
+    monkey-patching are both bypassed by nn.Module's attribute resolution
+    in this PyG/PyTorch version combination.
     """
-    if memory.last_update.dtype == torch.long:
-        return  # old PyG — Long buffer, no mismatch
-    if getattr(TGNMemory._update_memory, '_dtype_patched', False):
-        return  # already patched this session
 
-    def _fixed(self, n_id):
+    def _update_memory(self, n_id):
         mem, last_update = self._get_updated_memory(n_id)
         self.memory[n_id] = mem
         self.last_update[n_id] = last_update.to(self.last_update.dtype)
-
-    _fixed._dtype_patched = True
-    TGNMemory._update_memory = _fixed
 
 
 class GraphAttentionEmbedding(nn.Module):
@@ -66,12 +59,11 @@ class TGN_IDS(nn.Module):
     def __init__(self, num_nodes: int, raw_msg_dim: int,
                  memory_dim: int = 100, time_dim: int = 100, embed_dim: int = 100):
         super().__init__()
-        self.memory = TGNMemory(
+        self.memory = _SafeTGNMemory(
             num_nodes, raw_msg_dim, memory_dim, time_dim,
             message_module=IdentityMessage(raw_msg_dim, memory_dim, time_dim),
             aggregator_module=LastAggregator(),
         )
-        _fix_tgn_memory_dtype(self.memory)
         self.gnn = GraphAttentionEmbedding(
             memory_dim, embed_dim, raw_msg_dim, self.memory.time_enc,
         )
@@ -111,12 +103,11 @@ class TGN_MemoryOnly(nn.Module):
     def __init__(self, num_nodes: int, raw_msg_dim: int,
                  memory_dim: int = 100, time_dim: int = 100):
         super().__init__()
-        self.memory = TGNMemory(
+        self.memory = _SafeTGNMemory(
             num_nodes, raw_msg_dim, memory_dim, time_dim,
             message_module=IdentityMessage(raw_msg_dim, memory_dim, time_dim),
             aggregator_module=LastAggregator(),
         )
-        _fix_tgn_memory_dtype(self.memory)
         self.classifier = nn.Sequential(
             nn.Linear(2 * memory_dim + raw_msg_dim, memory_dim),
             nn.ReLU(),

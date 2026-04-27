@@ -41,29 +41,6 @@ from src.train.eval import eval_egraphsage, eval_tgn
 log = logging.getLogger(__name__)
 
 
-def _patch_tgn_memory_dtype(memory) -> None:
-    """
-    Fix RuntimeError: expected scalar type Float but found Long at tgn.py:128.
-    Instance-level types.MethodType patching is silently bypassed by
-    nn.Module's attribute resolution, so we patch at the CLASS level instead.
-    The cast is a no-op when dtypes already match (older PyG with Long buffer).
-    """
-    from torch_geometric.nn import TGNMemory
-
-    if memory.last_update.dtype == torch.long:
-        return
-    if getattr(TGNMemory._update_memory, '_dtype_patched', False):
-        return
-
-    def _fixed(self, n_id):
-        mem, last_update = self._get_updated_memory(n_id)
-        self.memory[n_id] = mem
-        self.last_update[n_id] = last_update.to(self.last_update.dtype)
-
-    _fixed._dtype_patched = True
-    TGNMemory._update_memory = _fixed
-
-
 SEED = 0
 PHASE2_FOLDS = [
     {"train": ["lycos_ids2017", "unsw_nb15", "ton_iot"],     "test": "cic_ids2018"},
@@ -457,7 +434,6 @@ def run_q3b(dev):
         num_nodes = combined.num_nodes + test_graph.num_nodes
 
         model = TGN_IDS(num_nodes, max_feat)
-        _patch_tgn_memory_dtype(model.memory)
         best_state = train_tgn(
             model, combined, val_data=None,
             device=device, use_quantile=True,
