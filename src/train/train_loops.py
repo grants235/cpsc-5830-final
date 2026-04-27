@@ -135,7 +135,13 @@ def train_tgn(
     edge_attr = (train_data.edge_attr_q if use_quantile else train_data.edge_attr).to(device)
     src_all   = train_data.edge_index[0].to(device)
     dst_all   = train_data.edge_index[1].to(device)
-    t_all     = train_data.edge_time.to(device)
+    # Normalize timestamps to [0, 1] relative to the training pass.
+    # Raw epoch µs-timestamps (~10^15) completely overflow float32 in TGN's time encoder,
+    # causing NaN gradients on every fold. [0,1] gives full float32 precision.
+    t_raw   = train_data.edge_time.to(device).float()
+    t_min   = t_raw.min()
+    t_range = t_raw.max() - t_min
+    t_all   = (t_raw - t_min) / (t_range + 1e-6)
     y_all     = train_data.edge_label.to(device)
 
     best_mcc, best_state, patience_cnt = -2.0, None, 0

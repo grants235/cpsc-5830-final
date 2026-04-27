@@ -75,7 +75,11 @@ def eval_tgn(
     edge_attr = (data.edge_attr_q if use_quantile else data.edge_attr).to(device)
     src_all   = data.edge_index[0]
     dst_all   = data.edge_index[1]
-    t_all     = data.edge_time.to(device)
+    # Normalize timestamps to [0, 1] (same fix as train_tgn).
+    t_raw   = data.edge_time.float().to(device)
+    t_min   = t_raw.min()
+    t_range = t_raw.max() - t_min
+    t_all   = (t_raw - t_min) / (t_range + 1e-6)
     y_true    = data.edge_label.numpy()
 
     all_preds, all_scores = [], []
