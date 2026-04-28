@@ -250,9 +250,19 @@ def _train_lqe_model(graph, device, seed, exp_id, test_dset,
 def _probe_on_lqe_encoder(model, train_dsets, dev, seed, device,
                           tier="A", kind="lqe", max_per_ds=10_000):
     """Linear probe: predict source dataset from encoder embeddings."""
+    # Load all graphs first so we can find the max feature dim (needed for Tier-B)
+    graphs = [_build_lqe_graph(ds, tier, dev, kind) for ds in train_dsets]
+    max_feat = max(g.edge_attr_q.shape[1] for g in graphs)
+
     all_embs, all_labels = [], []
-    for ds_idx, ds in enumerate(train_dsets):
-        g    = _build_lqe_graph(ds, tier, dev, kind)
+    for ds_idx, g in enumerate(graphs):
+        # Pad to max_feat so the model (trained on combined graph) accepts the features
+        d = g.edge_attr_q.shape[1]
+        if d < max_feat:
+            pad = torch.zeros(g.edge_attr_q.shape[0], max_feat - d)
+            g = copy.copy(g)
+            g.edge_attr   = torch.cat([g.edge_attr,   pad], dim=1)
+            g.edge_attr_q = torch.cat([g.edge_attr_q, pad], dim=1)
         embs = _extract_embeddings(model, g, device)
         rng  = np.random.RandomState(seed)
         idx  = rng.choice(len(embs), min(max_per_ds, len(embs)), replace=False)
