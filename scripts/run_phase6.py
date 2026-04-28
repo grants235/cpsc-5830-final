@@ -796,12 +796,38 @@ def run_e6_4_hybrid(base, seeds, dev):
             log_result(exp_id, seed, train_dsets, test_dset, "mcc", metrics["mcc"], elapsed)
             log_result(exp_id, seed, train_dsets, test_dset, "macro_f1", metrics["macro_f1"], elapsed)
 
-            # Probe on supervised hybrid encoder
-            probe_acc = _probe_on_encoder(model, train_dsets, dev, seed, device)
+            # Probe on supervised hybrid encoder (needs 2-dim hybrid features)
+            probe_acc = _probe_on_hybrid_encoder(
+                model, iforest, encoder, train_dsets, dev, seed, device)
             log.info(f"  Hybrid probe accuracy: {probe_acc:.4f}")
             log_result(exp_id, seed, train_dsets, test_dset, "dataset_probe_acc", probe_acc, 0.0)
 
     _print_method_summary(f"E6.4_hybrid_{base.split('_')[0]}", seeds)
+
+
+def _probe_on_hybrid_encoder(sup_model, iforest, anomaly_encoder,
+                             train_dsets, dev, seed, device, max_per_ds=10000):
+    """
+    Probe for E6.4: the supervised model takes 2-dim hybrid features, so we must
+    build [1.0, anomaly_score] edge features for each training dataset before
+    extracting embeddings.
+    """
+    all_embs, all_labels = [], []
+    for ds_idx, ds in enumerate(train_dsets):
+        g      = load_graph(ds, tier="A", dev=dev)
+        scores = _get_anomaly_scores(iforest, anomaly_encoder, g, device)
+        g_hyb  = _build_hybrid_graph(g, scores)
+        embs   = _extract_embeddings(sup_model, g_hyb, device)
+        rng    = np.random.RandomState(seed)
+        idx    = rng.choice(len(embs), min(max_per_ds, len(embs)), replace=False)
+        all_embs.append(embs[idx])
+        all_labels.extend([ds_idx] * len(idx))
+    X = np.concatenate(all_embs)
+    y = np.array(all_labels)
+    ti, vi = _tts(np.arange(len(X)), test_size=0.2, random_state=seed, stratify=y)
+    clf = LogisticRegression(max_iter=1000, random_state=seed)
+    clf.fit(X[ti], y[ti])
+    return accuracy_score(y[vi], clf.predict(X[vi]))
 
 
 def _get_anomaly_scores(iforest, encoder, graph, device):
