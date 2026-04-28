@@ -419,6 +419,9 @@ def run_p3_4_embed_analysis(model_folds, seed, dev):
         atk_labels = np.array(umap_atk_labels)
 
         log.info(f"    Running UMAP on {len(X_umap)} points (n_neighbors=30, min_dist=0.1)…")
+        # Small jitter prevents spectral initialisation failure on near-degenerate embeddings
+        rng_j = np.random.RandomState(seed + 99)
+        X_umap = X_umap + rng_j.normal(0, 1e-4, X_umap.shape).astype(np.float32)
         reducer = umap_mod.UMAP(n_components=2, random_state=seed, n_jobs=1,
                                 n_neighbors=30, min_dist=0.1)
         embs_2d = reducer.fit_transform(X_umap)
