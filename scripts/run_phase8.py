@@ -48,11 +48,13 @@ log = logging.getLogger(__name__)
 FIGURES_DIR  = Path("results/figures/phase8")
 DEFAULT_DELTA = 60            # seconds
 DELTA_SWEEP  = [10, 60, 300, 1800]
-MAX_SUB_EDGES = 1024
-BATCH_SIZE   = 256            # query edges per batch
-MAX_EPOCHS   = 20
-PATIENCE     = 5
-NODE_FEAT_DIM = 8
+MAX_SUB_EDGES    = 1024
+BATCH_SIZE       = 2048       # query edges per batch (large → fewer Python iters)
+MAX_TRAIN_EDGES  = 200_000    # cap training edges per epoch (subgraph extraction is expensive)
+MAX_EPOCHS       = 20
+PATIENCE         = 5
+NODE_FEAT_DIM    = 8
+N_JOBS           = 1          # subgraph extraction workers (threading overhead > gain for small subgraphs)
 
 PAIRWISE_FOLDS = [
     {"train": ["cic_ids2018"],   "test": "lycos_ids2017"},
@@ -137,10 +139,14 @@ def _embed_batch(model, data_list, device):
 
 def _train_temporal(model, graph, device, seed, exp_id, test_dset, delta_us,
                     max_edges=MAX_SUB_EDGES, epochs=MAX_EPOCHS, patience=PATIENCE,
-                    batch_size=BATCH_SIZE):
+                    batch_size=BATCH_SIZE, max_train_edges=MAX_TRAIN_EDGES):
     """
     Train a temporal GNN (TS-SAGE or TS-IDGNN) on `graph`.
     Returns (model, best_state_dict).
+
+    max_train_edges: stratified subsample of training edges per epoch.
+    Subgraph extraction is expensive; iterating over 6M edges per epoch is
+    intractable. 200K edges → ~100 batches/epoch, ~1 min/epoch on CPU.
     """
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
@@ -154,13 +160,33 @@ def _train_temporal(model, graph, device, seed, exp_id, test_dset, delta_us,
     # Stratified 80/20 train/val split
     ti, vi = _tts(np.arange(n), test_size=0.2, random_state=seed,
                   stratify=labels_np)
-    ti_arr = np.array(ti, dtype=np.int64)
+    ti_full = np.array(ti, dtype=np.int64)
+
+    # Cap val set too so validation doesn't dominate wall time
+    max_val = max_train_edges // 4
+    if len(vi) > max_val:
+        rng_val = np.random.RandomState(seed + 999)
+        vi = rng_val.choice(vi, max_val, replace=False)
+    vi = np.array(vi, dtype=np.int64)
+
+    log.info(f"  train pool={len(ti_full):,}  val={len(vi):,}"
+             f"  epoch_cap={min(max_train_edges, len(ti_full)):,}")
 
     best_mcc, best_state, pat_cnt = -2.0, None, 0
+    ep_rng = np.random.RandomState(seed)
 
     for epoch in range(epochs):
         model.train()
-        np.random.shuffle(ti_arr)
+        # Stratified subsample of training edges for this epoch
+        if len(ti_full) > max_train_edges:
+            ep_labels = labels_np[ti_full]
+            ti_arr, _ = _tts(ti_full, test_size=1.0 - max_train_edges / len(ti_full),
+                              random_state=ep_rng.randint(0, 2**31),
+                              stratify=ep_labels)
+            ti_arr = np.array(ti_arr, dtype=np.int64)
+        else:
+            ti_arr = ti_full.copy()
+        ep_rng.shuffle(ti_arr)
         ep_loss, n_batches = 0.0, 0
 
         for start in range(0, len(ti_arr), batch_size):
@@ -175,6 +201,7 @@ def _train_temporal(model, graph, device, seed, exp_id, test_dset, delta_us,
                 yu_np, yv_np, yt_np,
                 delta_us=delta_us, max_edges=max_edges,
                 node_feat_dim=NODE_FEAT_DIM, seed=seed,
+                n_jobs=N_JOBS,
             )
 
             logits = _forward_batch(model, data_list, yl, device)
@@ -190,7 +217,7 @@ def _train_temporal(model, graph, device, seed, exp_id, test_dset, delta_us,
         model.eval()
         all_preds = []
         for start in range(0, len(vi), batch_size):
-            ids   = vi[start:start + batch_size]
+            ids   = vi[start:start + batch_size]  # vi already capped above
             yu_np = src_np[ids]
             yv_np = dst_np[ids]
             yt_np = time_np[ids]
@@ -201,6 +228,7 @@ def _train_temporal(model, graph, device, seed, exp_id, test_dset, delta_us,
                     yu_np, yv_np, yt_np,
                     delta_us=delta_us, max_edges=max_edges,
                     node_feat_dim=NODE_FEAT_DIM, seed=seed,
+                    n_jobs=N_JOBS,
                 )
                 logits = _forward_batch(model, data_list, yl, device)
             all_preds.append(logits.argmax(1).cpu().numpy())
@@ -251,6 +279,7 @@ def _eval_temporal(model, graph, device, delta_us,
             yu_np, yv_np, yt_np,
             delta_us=delta_us, max_edges=max_edges,
             node_feat_dim=NODE_FEAT_DIM, seed=0,
+            n_jobs=N_JOBS,
         )
         logits = _forward_batch(model, data_list, yl, device)
         probs  = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
@@ -291,6 +320,7 @@ def _probe_on_temporal_encoder(model, train_dsets, dev, seed, device, delta_us,
                 src_np[ids], dst_np[ids], time_np[ids],
                 delta_us=delta_us, max_edges=max_edges,
                 node_feat_dim=NODE_FEAT_DIM, seed=seed,
+                n_jobs=N_JOBS,
             )
             with torch.no_grad():
                 embs.append(_embed_batch(model, data_list, device).cpu().numpy())
@@ -637,9 +667,18 @@ def main():
     parser.add_argument("--seeds",   nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--seed",    type=int,  default=0)
     parser.add_argument("--models",  nargs="+", default=["ts_sage", "ts_idgnn"])
-    parser.add_argument("--dev",     action="store_true", default=True)
-    parser.add_argument("--no-dev",  dest="dev", action="store_false")
+    parser.add_argument("--dev",    action="store_true", default=True)
+    parser.add_argument("--no-dev", dest="dev", action="store_false")
+    parser.add_argument("--n-jobs", type=int, default=N_JOBS,
+                        help="Subgraph extraction workers (default: 1; try 4-8 on many-core nodes)")
+    parser.add_argument("--max-train-edges", type=int, default=MAX_TRAIN_EDGES,
+                        help="Training edge cap per epoch (default: 200000)")
     args = parser.parse_args()
+
+    # Allow CLI overrides of globals
+    import scripts.run_phase8 as _self
+    _self.N_JOBS          = args.n_jobs
+    _self.MAX_TRAIN_EDGES = args.max_train_edges
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 

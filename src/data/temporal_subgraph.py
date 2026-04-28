@@ -11,7 +11,12 @@ graph_builder.build_graph and combine_graphs).
 
 import numpy as np
 import torch
+from concurrent.futures import ThreadPoolExecutor
 from torch_geometric.data import Data
+
+# Pre-cap multiplier: subsample window to this many edges before BFS.
+# Bounds BFS cost on dense datasets (e.g. CIC2018 with 60K+ edges per 60s window).
+_BFS_PRE_CAP = 4
 
 
 def extract_temporal_subgraph(
@@ -50,10 +55,25 @@ def extract_temporal_subgraph(
     if lo >= hi:
         return np.empty(0, dtype=np.int64)
 
-    w_src = src_np[lo:hi]
-    w_dst = dst_np[lo:hi]
+    window_size = hi - lo
+    pre_cap     = max_edges * _BFS_PRE_CAP
 
-    # 2-hop BFS from (u, v) within the time window
+    # Pre-subsample before BFS to bound cost on dense windows (e.g. CIC2018
+    # has ~60K edges per 60s window; BFS on 60K is very slow).
+    if window_size > pre_cap:
+        if rng is None:
+            rng = np.random.RandomState()
+        pre_local = rng.choice(window_size, pre_cap, replace=False)
+        pre_local.sort()
+        w_src       = src_np[lo + pre_local]
+        w_dst       = dst_np[lo + pre_local]
+        global_base = (lo + pre_local).astype(np.int64)
+    else:
+        w_src       = src_np[lo:hi]
+        w_dst       = dst_np[lo:hi]
+        global_base = np.arange(lo, hi, dtype=np.int64)
+
+    # 2-hop BFS from (u, v) within the (pre-capped) window
     node_set = np.array([u, v], dtype=np.int64)
     for _ in range(n_hops):
         inc = np.isin(w_src, node_set) | np.isin(w_dst, node_set)
@@ -64,7 +84,7 @@ def extract_temporal_subgraph(
     # Keep edges where either endpoint is in node_set
     final_inc  = np.isin(w_src, node_set) | np.isin(w_dst, node_set)
     local_idx  = np.where(final_inc)[0]
-    global_idx = lo + local_idx
+    global_idx = global_base[local_idx]
 
     # Cap at max_edges
     if len(global_idx) > max_edges:
@@ -134,23 +154,36 @@ def batch_build_subgraphs(
     max_edges: int = 1024,
     node_feat_dim: int = 8,
     seed: int = 0,
+    n_jobs: int = 4,
 ) -> list:
     """
     Build a list of Data objects for a batch of query edges.
     Returned list has the same length as query_u_arr.
+
+    n_jobs: worker threads for parallel extraction (NumPy releases the GIL).
     """
-    rng      = np.random.RandomState(seed)
-    data_list = []
-    for i in range(len(query_u_arr)):
-        gidx = extract_temporal_subgraph(
+    n    = len(query_u_arr)
+    rng  = np.random.RandomState(seed)
+    # Give each worker its own seed so RNG choices don't collide
+    per_seeds = rng.randint(0, 2**31, size=n)
+
+    def _one(i: int) -> Data:
+        rng_i = np.random.RandomState(int(per_seeds[i]))
+        gidx  = extract_temporal_subgraph(
             src_np, dst_np, time_np,
             int(query_u_arr[i]), int(query_v_arr[i]), int(query_t_arr[i]),
-            delta_us, max_edges, rng=rng,
+            delta_us, max_edges, rng=rng_i,
         )
-        data = build_subgraph_data(
+        return build_subgraph_data(
             src_np, dst_np, gidx,
             int(query_u_arr[i]), int(query_v_arr[i]),
             node_feat_dim=node_feat_dim,
         )
-        data_list.append(data)
+
+    if n_jobs > 1 and n > 1:
+        with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+            data_list = list(ex.map(_one, range(n)))
+    else:
+        data_list = [_one(i) for i in range(n)]
+
     return data_list
