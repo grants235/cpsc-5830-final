@@ -35,7 +35,7 @@ from sklearn.model_selection import train_test_split as _tts
 
 from run_phase4 import (
     ALL_FOLDS, E1E_REF, E1E_MEAN,
-    _make_struct_only, _load_fold_struct, _make_val_split,
+    _make_val_split,
     _get_domain_labels, _run_probe_on_encoder,
 )
 
@@ -59,6 +59,37 @@ CONTRAST_ALPHA = 0.5
 CONTRAST_TEMP  = 0.1
 N_TRIPLETS     = 512
 PROJ_DIM       = 64
+# Tier-A has 4 features (byte_count, packet_count, tcp_flags_any, flow_duration_ms).
+# DGI needs informative edge features: with constant-ones (structure-only), the
+# shuffled-feature negative equals the positive and the discriminator learns nothing.
+ANOMALY_EDGE_IN = 4
+
+
+# ── fold loading with informative Tier-A features ────────────────────────────
+
+def _load_fold_anomaly(fold, dev):
+    """
+    Load fold with quantile-encoded Tier-A (4-dim) features.
+    Must NOT use structure-only (constant 1.0) features for DGI because the
+    shuffled-feature negative would be identical to the positive, making the
+    discriminator's task trivial and the encoder learn nothing.
+    """
+    train_dsets = fold["train"]
+    test_dset   = fold["test"]
+    train_graphs = [load_graph(ds, tier="A", dev=dev) for ds in train_dsets]
+    combined     = combine_graphs(train_graphs)
+    test_graph   = load_graph(test_dset, tier="A", dev=dev)
+    # Tier-A is always 4-dim so no padding needed, but guard anyway
+    max_feat = combined.edge_attr.shape[1]
+    d = test_graph.edge_attr.shape[1]
+    if d < max_feat:
+        pad = torch.zeros(test_graph.edge_attr.shape[0], max_feat - d)
+        test_graph.edge_attr   = torch.cat([test_graph.edge_attr, pad], dim=1)
+        test_graph.edge_attr_q = torch.cat([test_graph.edge_attr_q, pad], dim=1)
+    elif d > max_feat:
+        test_graph.edge_attr   = test_graph.edge_attr[:, :max_feat]
+        test_graph.edge_attr_q = test_graph.edge_attr_q[:, :max_feat]
+    return combined, test_graph, train_dsets, test_dset
 
 
 # ── Edge DGI ─────────────────────────────────────────────────────────────────
@@ -335,25 +366,31 @@ def _train_msa_model(msa_dgi, benign_graph, domain_labels, device,
 
 def _fit_if(encoder, benign_graph, device, seed=0):
     log.info(f"  Fitting IsolationForest on {benign_graph.edge_label.shape[0]} benign edges…")
-    embs = _extract_embeddings(encoder, benign_graph, device)
+    embs  = _extract_embeddings(encoder, benign_graph, device)
     n_est = 100
     max_s = 256 if embs.shape[0] > 2_000_000 else "auto"
+    # Use contamination=0.1 as a neutral default rather than "auto" which can
+    # miscalibrate the decision_function offset when attack rate ≠ ~10%.
+    # We bypass decision_function entirely (use score_samples + grid search),
+    # so this only affects the offset attribute; set it conservatively.
     iforest = IsolationForest(n_estimators=n_est, max_samples=max_s,
-                               contamination="auto", random_state=seed)
+                               contamination=0.1, random_state=seed)
     iforest.fit(embs)
     return iforest
 
 
 def _select_threshold(if_model, encoder, val_graph, device):
     """
-    Fit threshold on val graph (benign + attack) to maximize val MCC.
+    Score val edges, grid-search threshold over full score range to maximise val MCC.
+    Searches from 1st to 99th percentile so we don't miss the optimal cut even when
+    attack rate is far from 50%.
     Returns (threshold, val_mcc_at_thresh).
     """
     embs   = _extract_embeddings(encoder, val_graph, device)
     scores = -if_model.score_samples(embs)   # higher = more anomalous
     labels = val_graph.edge_label.numpy()
 
-    pct   = np.linspace(50.0, 99.5, 300)
+    pct        = np.linspace(1.0, 99.0, 500)
     thresholds = np.unique(np.percentile(scores, pct))
     best_t, best_mcc_v = thresholds[len(thresholds) // 2], -2.0
     for t in thresholds:
@@ -374,7 +411,7 @@ def _anomaly_predict(if_model, encoder, graph, thresh, device):
 
 # ── load helpers ──────────────────────────────────────────────────────────────
 
-def _load_encoder(exp_id_prefix, seed, test_dset, node_in=8, edge_in=1, hidden=128):
+def _load_encoder(exp_id_prefix, seed, test_dset, node_in=8, edge_in=ANOMALY_EDGE_IN, hidden=128):
     p = MODELS_DIR / f"{exp_id_prefix}_encoder_seed{seed}_test{test_dset}.pt"
     enc = EdgeAwareSAGE(node_in=node_in, edge_in=edge_in, hidden=hidden)
     enc.load_state_dict(torch.load(p, weights_only=True))
@@ -406,7 +443,7 @@ def run_e6_1_anomal_e(seeds, dev):
             t0 = time.time()
             log.info(f"\n  Fold: train={train_dsets}  test={test_dset}  seed={seed}")
 
-            combined, test_graph, _, _ = _load_fold_struct(fold, dev)
+            combined, test_graph, _, _ = _load_fold_anomaly(fold, dev)
             val_split  = _make_val_split(combined)
 
             # Filter combined to benign only, subsample for DGI training
@@ -422,7 +459,7 @@ def run_e6_1_anomal_e(seeds, dev):
             val_graph = _index_subgraph(combined, val_idx)
 
             # Pretrain DGI on benign
-            encoder = EdgeAwareSAGE(node_in=8, edge_in=1, hidden=128)
+            encoder = EdgeAwareSAGE(node_in=8, edge_in=ANOMALY_EDGE_IN, hidden=128)
             dgi     = EdgeDGI(encoder, hidden=128)
             dgi_state = _train_dgi_model(dgi, benign_train, device)
 
@@ -478,7 +515,7 @@ def _probe_on_encoder(encoder, train_dsets, dev, seed, device, max_per_ds=10000)
     """Linear probe: predict source dataset from encoder embeddings. Returns accuracy."""
     all_embs, all_labels = [], []
     for ds_idx, ds in enumerate(train_dsets):
-        g    = _make_struct_only(load_graph(ds, tier="B", dev=dev))
+        g    = load_graph(ds, tier="A", dev=dev)
         embs = _extract_embeddings(encoder, g, device)
         rng  = np.random.RandomState(seed)
         idx  = rng.choice(len(embs), min(max_per_ds, len(embs)), replace=False)
@@ -541,7 +578,7 @@ def run_e6_2_msa(seeds, dev, alpha=CONTRAST_ALPHA):
             t0 = time.time()
             log.info(f"\n  Fold: train={train_dsets}  test={test_dset}  seed={seed}")
 
-            combined, test_graph, _, _ = _load_fold_struct(fold, dev)
+            combined, test_graph, _, _ = _load_fold_anomaly(fold, dev)
             val_split     = _make_val_split(combined)
             domain_labels = _get_domain_labels(train_dsets, dev)
 
@@ -569,7 +606,7 @@ def run_e6_2_msa(seeds, dev, alpha=CONTRAST_ALPHA):
             val_graph = _index_subgraph(combined, val_split["val"])
 
             # Pretrain MSA-DGI
-            encoder = EdgeAwareSAGE(node_in=8, edge_in=1, hidden=128)
+            encoder = EdgeAwareSAGE(node_in=8, edge_in=ANOMALY_EDGE_IN, hidden=128)
             msa     = MSA_DGI(encoder, hidden=128, proj_dim=PROJ_DIM)
             msa_state = _train_msa_model(
                 msa, benign_train, dom_labels_train, device, alpha=alpha)
@@ -657,7 +694,7 @@ def run_e6_3_probe(models, seed, dev):
                 log.warning(f"  Encoder not found: {enc_path}  (run E6.1/E6.2 first)")
                 continue
 
-            encoder = EdgeAwareSAGE(node_in=8, edge_in=1, hidden=128)
+            encoder = EdgeAwareSAGE(node_in=8, edge_in=ANOMALY_EDGE_IN, hidden=128)
             encoder.load_state_dict(torch.load(enc_path, weights_only=True))
 
             probe_acc = _probe_on_encoder(encoder, train_dsets, dev, seed, device)
@@ -728,11 +765,11 @@ def run_e6_4_hybrid(base, seeds, dev):
             t0 = time.time()
             log.info(f"\n  Fold: train={train_dsets}  test={test_dset}  seed={seed}  base={base}")
 
-            encoder = EdgeAwareSAGE(node_in=8, edge_in=1, hidden=128)
+            encoder = EdgeAwareSAGE(node_in=8, edge_in=ANOMALY_EDGE_IN, hidden=128)
             encoder.load_state_dict(torch.load(enc_path, weights_only=True))
             iforest = torch.load(if_path, weights_only=False)
 
-            combined, test_graph, _, _ = _load_fold_struct(fold, dev)
+            combined, test_graph, _, _ = _load_fold_anomaly(fold, dev)
 
             # Compute anomaly scores for train+test
             train_scores = _get_anomaly_scores(iforest, encoder, combined, device)
@@ -812,11 +849,11 @@ def run_e6_5_per_attack(seed, dev):
             log.warning(f"  Missing checkpoints for fold={test_dset} — skipping")
             continue
 
-        encoder = EdgeAwareSAGE(node_in=8, edge_in=1, hidden=128)
+        encoder = EdgeAwareSAGE(node_in=8, edge_in=ANOMALY_EDGE_IN, hidden=128)
         encoder.load_state_dict(torch.load(enc_path, weights_only=True))
         iforest = torch.load(if_path, weights_only=False)
 
-        combined, test_graph, _, _ = _load_fold_struct(fold, dev)
+        combined, test_graph, _, _ = _load_fold_anomaly(fold, dev)
         val_split = _make_val_split(combined)
         val_graph = _index_subgraph(combined, val_split["val"])
 
