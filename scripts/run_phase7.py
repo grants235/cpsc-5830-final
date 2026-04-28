@@ -252,11 +252,15 @@ def _probe_on_lqe_encoder(model, train_dsets, dev, seed, device,
     """Linear probe: predict source dataset from encoder embeddings."""
     # Load all graphs first so we can find the max feature dim (needed for Tier-B)
     graphs = [_build_lqe_graph(ds, tier, dev, kind) for ds in train_dsets]
-    max_feat = max(g.edge_attr_q.shape[1] for g in graphs)
+
+    # Use the model's actual expected edge_in (from its first linear layer) as the
+    # authoritative target dim — covers Tier-B padding AND hybrid's extra score dim.
+    model_feat = model.edge_enc[0].in_features
+    max_feat   = max(model_feat, max(g.edge_attr_q.shape[1] for g in graphs))
 
     all_embs, all_labels = [], []
     for ds_idx, g in enumerate(graphs):
-        # Pad to max_feat so the model (trained on combined graph) accepts the features
+        # Pad to max_feat so the model accepts the features regardless of tier/kind
         d = g.edge_attr_q.shape[1]
         if d < max_feat:
             pad = torch.zeros(g.edge_attr_q.shape[0], max_feat - d)
