@@ -381,8 +381,7 @@ def run_p3_4_embed_analysis(model_folds, seed, dev):
         X_tr, X_val = X[ti], X[vi]
         y_tr, y_val = y[ti], y[vi]
 
-        clf = LogisticRegression(multi_class="multinomial", max_iter=1000,
-                                 random_state=seed, n_jobs=-1)
+        clf = LogisticRegression(max_iter=1000, random_state=seed, n_jobs=-1)
         clf.fit(X_tr, y_tr)
         acc       = accuracy_score(y_val, clf.predict(X_val))
         random_b  = 1.0 / len(train_dsets)
