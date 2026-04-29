@@ -112,6 +112,22 @@ def reported_mcc_at(scores, labels, threshold=0.5):
 
 # ── A.2  Calibration table ────────────────────────────────────────────────────
 
+def _load_inference_file(f: Path) -> dict:
+    """Load an inference .pt file, handling both old (string list) and new (int8) formats."""
+    data = torch.load(f, weights_only=False)
+    # Decode attack_classes: new format stores int8 ids + vocab
+    if "attack_class_ids" in data:
+        vocab = data.get("attack_class_vocab",
+                         ["Benign","Reconnaissance","DoS_DDoS",
+                          "Injection_Exploit","BruteForce","Botnet_C2"])
+        ids   = np.asarray(data["attack_class_ids"], dtype=np.int8)
+        data["attack_classes"] = [vocab[i] if 0 <= i < len(vocab) else "Unknown"
+                                  for i in ids]
+    # Normalise labels dtype
+    data["labels"] = np.asarray(data["labels"], dtype=np.int64)
+    return data
+
+
 def build_calibration_table(inference_dir: Path) -> list:
     rows = []
     files = sorted(inference_dir.glob("*.pt"))
@@ -119,13 +135,13 @@ def build_calibration_table(inference_dir: Path) -> list:
 
     for f in files:
         try:
-            data = torch.load(f, weights_only=False)
+            data = _load_inference_file(f)
         except Exception as e:
             log.warning(f"  Cannot load {f.name}: {e}")
             continue
 
         scores  = np.asarray(data["scores"],  dtype=np.float32)
-        labels  = np.asarray(data["labels"],  dtype=np.int64)
+        labels  = data["labels"]
         method  = data["method"]
         seed    = data["seed"]
         fold    = data["test_fold"]
@@ -445,11 +461,11 @@ def per_attack_oracle_f1(inference_dir: Path, out_path: Path):
 
     for f in sorted(inference_dir.glob("*.pt")):
         try:
-            data = torch.load(f, weights_only=False)
+            data = _load_inference_file(f)
         except Exception:
             continue
         scores = np.asarray(data["scores"],  dtype=np.float32)
-        labels = np.asarray(data["labels"],  dtype=np.int64)
+        labels = data["labels"]
         ac     = np.array(data["attack_classes"])
         method = data["method"]
         fold   = data["test_fold"]
@@ -777,9 +793,9 @@ def score_histograms(rows: list, inference_lookup: dict, out_path: Path):
         if not inf_files:
             ax.set_title(f"{fold}\n(no data)"); continue
 
-        data   = torch.load(inf_files[0], weights_only=False)
+        data   = _load_inference_file(inf_files[0])
         scores = np.asarray(data["scores"], dtype=np.float32)
-        labels = np.asarray(data["labels"], dtype=np.int64)
+        labels = data["labels"]
         benign = scores[labels == 0]
         attack = scores[labels == 1]
 
