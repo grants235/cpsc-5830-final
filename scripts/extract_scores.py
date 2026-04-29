@@ -189,7 +189,18 @@ def load_test_graph(test_fold: str, edge_in: int, method: str,
 # ── inference helpers ─────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def _infer_sage(model, graph, device, bs=50_000):
+def _infer_sage(model, graph, device, bs=20_000):
+    """
+    Local-subgraph batched inference.
+
+    Passing the full node matrix to EdgeAwareSAGE's forward causes
+    scatter(e, col, dim_size=N_all_nodes) to allocate [N_all, H] tensors
+    on every batch — fatal for large graphs with many unique IPs.
+    _to_local_graph remaps each batch to only its involved nodes, so the
+    internal scatter tensor is proportional to batch size (~100 K nodes),
+    not the full graph (~1 M+ nodes).
+    """
+    from run_phase6 import _to_local_graph
     model.eval().to(device)
     x  = graph.x.to(device)
     ei = graph.edge_index.to(device)
@@ -197,14 +208,19 @@ def _infer_sage(model, graph, device, bs=50_000):
     E  = ei.shape[1]
     parts = []
     for s in range(0, E, bs):
-        logits = model(x, ei[:, s:s+bs], ea[s:s+bs])
+        ids = np.arange(s, min(s + bs, E))
+        x_b, ei_b, ea_b = _to_local_graph(x, ei, ea, ids, device)
+        logits = model(x_b, ei_b, ea_b)
         parts.append(F.softmax(logits, dim=-1)[:, 1].cpu().numpy())
+        del x_b, ei_b, ea_b, logits
     del x, ei, ea
     return np.concatenate(parts).astype(np.float32)
 
 
 @torch.no_grad()
-def _infer_dann(model, graph, device, bs=50_000):
+def _infer_dann(model, graph, device, bs=20_000):
+    """Same local-subgraph batching as _infer_sage, for DANN/CDAN models."""
+    from run_phase6 import _to_local_graph
     model.eval().to(device)
     x  = graph.x.to(device)
     ei = graph.edge_index.to(device)
@@ -212,8 +228,11 @@ def _infer_dann(model, graph, device, bs=50_000):
     E  = ei.shape[1]
     parts = []
     for s in range(0, E, bs):
-        logits = model.predict(x, ei[:, s:s+bs], ea[s:s+bs])
+        ids = np.arange(s, min(s + bs, E))
+        x_b, ei_b, ea_b = _to_local_graph(x, ei, ea, ids, device)
+        logits = model.predict(x_b, ei_b, ea_b)
         parts.append(F.softmax(logits, dim=-1)[:, 1].cpu().numpy())
+        del x_b, ei_b, ea_b, logits
     del x, ei, ea
     return np.concatenate(parts).astype(np.float32)
 
@@ -440,24 +459,27 @@ def process_gate(ckpt_path: Path, info: dict, dev: bool, device: str):
     w = torch.cat(gate_parts, dim=0)            # [E, n_src]
     del gate_parts, ea_a_dev, ea_q_a, g_tier_a
 
-    # Specialist logits — one specialist at a time to avoid holding all simultaneously
+    # Specialist logits — one specialist at a time, local-subgraph batched
+    from run_phase6 import _to_local_graph
     x_t  = g_struct.x.to(device)
     ei_t = g_struct.edge_index.to(device)
     ea_t = g_struct.edge_attr_q.to(device)
+    BS   = 20_000
 
-    # Build weighted sum incrementally: combined[e,c] += w[e,s] * logit[e,s,c]
     combined = torch.zeros(E, 2)
     for src_d, spec in enumerate(specialists):
         spec.eval().to(device)
         parts = []
         with torch.no_grad():
-            for s in range(0, E, 50_000):
-                parts.append(spec.predict(x_t, ei_t[:, s:s+50_000],
-                                          ea_t[s:s+50_000]).cpu())
+            for s in range(0, E, BS):
+                ids = np.arange(s, min(s + BS, E))
+                x_b, ei_b, ea_b = _to_local_graph(x_t, ei_t, ea_t, ids, device)
+                parts.append(spec.predict(x_b, ei_b, ea_b).cpu())
+                del x_b, ei_b, ea_b
         logits = torch.cat(parts, dim=0)            # [E, 2]
         combined += w[:, src_d:src_d+1] * logits
         del parts, logits
-        spec.cpu()                                   # move back to CPU to free device memory
+        spec.cpu()                                   # move off device
 
     del x_t, ei_t, ea_t, w, gate, specialists
 
