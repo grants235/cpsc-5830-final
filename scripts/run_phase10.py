@@ -183,9 +183,19 @@ def _probe_gib(model: GIB_EGraphSAGE, datasets: list, tier: str, dev: bool,
     all_embs, all_labels = [], []
     model.eval().to(device)
 
+    # Model's expected edge feature dim (from the first Linear layer in edge_enc)
+    model_edge_in = model.edge_enc[0].in_features
+
     for ds_idx, ds in enumerate(datasets):
         g    = load_graph(ds, tier=tier, dev=dev)
-        ea   = (g.edge_attr_q if use_quantile else g.edge_attr).to(device)
+        ea   = (g.edge_attr_q if use_quantile else g.edge_attr)
+        # Align to model's expected feature dim
+        d = ea.shape[1]
+        if d < model_edge_in:
+            ea = torch.cat([ea, torch.zeros(ea.shape[0], model_edge_in - d)], dim=1)
+        elif d > model_edge_in:
+            ea = ea[:, :model_edge_in]
+        ea   = ea.to(device)
         x_d  = g.x.to(device)
         ei_d = g.edge_index.to(device)
         E    = ei_d.shape[1]
