@@ -609,14 +609,33 @@ def _calibrate_file(f_str: str, rep_mcc: float, orc_mcc: float,
     return out
 
 
+def _resolve_inf_file(row: dict, inf_lookup: dict) -> str:
+    """
+    Return the inference file path for a calibration row.
+    Uses _inf_file if present (set during A.2 in the same run), otherwise
+    falls back to inf_lookup keyed by (method, fold).
+    """
+    cached = row.get("_inf_file", "")
+    if cached and Path(cached).is_file():
+        return cached
+    files = inf_lookup.get((row["method"], row["test_fold"]), [])
+    # Pick the file whose seed matches, or the first available
+    for f in files:
+        data = torch.load(f, weights_only=False)
+        if data.get("seed") == row["seed"]:
+            return str(f)
+    return str(files[0]) if files else ""
+
+
 def unsupervised_calibration(rows: list, gap_summary_: dict, out_csv: Path,
-                              workers: int = 4):
+                              inf_lookup: dict = None, workers: int = 4):
     if gap_summary_["threshold_bottlenecked"] <= 5:
         log.info("A.4: <6 threshold-bottlenecked pairs — skipping")
         return
 
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
+    inf_lookup = inf_lookup or {}
     high_gap = [r for r in rows if r["gap"] > 0.10]
     log.info(f"A.4: Calibrating {len(high_gap)} high-gap files "
              f"(workers={workers}) …")
@@ -624,7 +643,7 @@ def unsupervised_calibration(rows: list, gap_summary_: dict, out_csv: Path,
     all_rows = []
     if workers <= 1:
         for r in high_gap:
-            inf_path = r.get("_inf_file", "")
+            inf_path = _resolve_inf_file(r, inf_lookup)
             sub = _calibrate_file(inf_path, r["reported_mcc"], r["oracle_mcc"],
                                    r["method"], r["seed"], r["test_fold"])
             for row in sub:
@@ -637,7 +656,7 @@ def unsupervised_calibration(rows: list, gap_summary_: dict, out_csv: Path,
         with ProcessPoolExecutor(max_workers=workers) as ex:
             for r in high_gap:
                 fut = ex.submit(_calibrate_file,
-                                r.get("_inf_file",""),
+                                _resolve_inf_file(r, inf_lookup),
                                 r["reported_mcc"], r["oracle_mcc"],
                                 r["method"], r["seed"], r["test_fold"])
                 futures[fut] = r["method"]
@@ -1111,6 +1130,7 @@ def main():
             summary = gap_summary(rows)
         unsupervised_calibration(rows, summary,
                                  RESULTS_DIR / "calibration_unsupervised.csv",
+                                 inf_lookup=inf_lookup,
                                  workers=args.workers)
 
     # ── A.5 ──────────────────────────────────────────────────────────────────
