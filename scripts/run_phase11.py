@@ -92,17 +92,54 @@ def _auprc(y_true, scores):
         return float("nan")
 
 
-def oracle_mcc(scores, labels, n_thresholds=1000):
-    lo, hi = float(scores.min()), float(scores.max())
-    if lo == hi:
-        return _mcc(labels, (scores >= lo).astype(int)), lo
-    thresholds = np.linspace(lo, hi, n_thresholds)
-    best_mcc, best_t = -2.0, lo
-    for t in thresholds:
-        preds = (scores >= t).astype(int)
-        m = _mcc(labels, preds)
-        if m > best_mcc:
-            best_mcc, best_t = m, t
+def oracle_mcc(scores: np.ndarray, labels: np.ndarray, n_eval: int = 500):
+    """
+    O(E log E + n_eval) oracle MCC via cumulative-TP sweep.
+
+    Old approach: 1000 calls to sklearn.matthews_corrcoef, each O(E)
+      → O(E × 1000) ≈ 5 billion ops for a 5 M-edge graph.
+    New approach: sort once (O(E log E)), then one vectorised numpy pass
+      over n_eval candidate cut-points (no Python loop over edges at all).
+      → ~50-100× faster for large graphs.
+    """
+    P  = float(labels.sum())
+    N_ = float(len(labels)) - P
+    if P == 0 or N_ == 0:
+        return 0.0, float(scores.mean())
+    if float(scores.min()) == float(scores.max()):
+        pred = (scores >= scores[0]).astype(np.int64)
+        return _mcc(labels, pred), float(scores[0])
+
+    # Sort descending by score; cum_tp[k] = TP when top-(k+1) predicted positive
+    order  = np.argsort(-scores)
+    cum_tp = np.cumsum(labels[order].astype(np.float64))
+
+    # Sample n_eval evenly-spaced "number predicted positive" values
+    E   = len(scores)
+    ks  = np.unique(np.round(np.linspace(0, E, n_eval + 1)).astype(np.int64))
+    ks  = ks[(ks >= 0) & (ks <= E)]
+
+    # Vectorised TP / FP / TN / FN for every k
+    tp = np.where(ks == 0, 0.0, cum_tp[np.clip(ks - 1, 0, E - 1)])
+    tp = np.where(ks == 0, 0.0, tp)
+    fp = ks.astype(np.float64) - tp
+    tn = N_ - fp
+    fn = P  - tp
+
+    d   = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    mcc = np.where(d > 0, (tp * tn - fp * fn) / np.sqrt(np.maximum(d, 1e-12)), 0.0)
+
+    best_idx = int(np.argmax(mcc))
+    best_k   = int(ks[best_idx])
+    best_mcc = float(mcc[best_idx])
+
+    # Threshold = score of the (best_k)-th highest-scored edge
+    if best_k == 0:
+        best_t = float(scores.max()) + 1e-6
+    elif best_k >= E:
+        best_t = float(scores.min()) - 1e-6
+    else:
+        best_t = float(scores[order[best_k]])
     return best_mcc, best_t
 
 
@@ -128,60 +165,140 @@ def _load_inference_file(f: Path) -> dict:
     return data
 
 
-def build_calibration_table(inference_dir: Path) -> list:
-    rows = []
+def _metrics_for_file(f_str: str):
+    """
+    Compute calibration metrics for one inference file.
+    Top-level function so it can be pickled for ProcessPoolExecutor.
+    Returns a row dict, or None on error.
+    """
+    import numpy as np
+    import torch
+    from pathlib import Path
+    from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
+
+    f = Path(f_str)
+    try:
+        data = torch.load(f, weights_only=False)
+    except Exception as e:
+        return {"_error": str(e), "_file": f_str}
+
+    scores = np.asarray(data["scores"], dtype=np.float32)
+    labels = np.asarray(data["labels"], dtype=np.int64)
+    method = data["method"]
+    seed   = data["seed"]
+    fold   = data["test_fold"]
+
+    if len(scores) == 0 or len(np.unique(labels)) < 2:
+        return None
+
+    # reported MCC at 0.5
+    preds_05  = (scores >= 0.5).astype(np.int64)
+    rep_mcc   = float(matthews_corrcoef(labels, preds_05))
+
+    # oracle MCC — vectorised cumulative-TP sweep
+    P  = float(labels.sum())
+    N_ = float(len(labels)) - P
+    if P > 0 and N_ > 0 and scores.min() != scores.max():
+        order  = np.argsort(-scores)
+        cum_tp = np.cumsum(labels[order].astype(np.float64))
+        E      = len(scores)
+        ks     = np.unique(np.round(np.linspace(0, E, 501)).astype(np.int64))
+        ks     = ks[(ks >= 0) & (ks <= E)]
+        tp = np.where(ks == 0, 0.0, cum_tp[np.clip(ks - 1, 0, E - 1)])
+        tp = np.where(ks == 0, 0.0, tp)
+        fp = ks.astype(np.float64) - tp
+        tn = N_ - fp;  fn = P - tp
+        d   = (tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)
+        mcc_arr = np.where(d > 0, (tp*tn - fp*fn) / np.sqrt(np.maximum(d, 1e-12)), 0.0)
+        best_idx = int(np.argmax(mcc_arr))
+        best_k   = int(ks[best_idx])
+        orc_mcc  = float(mcc_arr[best_idx])
+        best_t   = (float(scores.max())+1e-6 if best_k == 0
+                    else float(scores.min())-1e-6 if best_k >= E
+                    else float(scores[order[best_k]]))
+    else:
+        orc_mcc = rep_mcc
+        best_t  = 0.5
+
+    # AUROC / AUPRC
+    try:
+        au_roc = float(roc_auc_score(labels, scores))
+    except Exception:
+        au_roc = float("nan")
+    try:
+        au_prc = float(average_precision_score(labels, scores))
+    except Exception:
+        au_prc = float("nan")
+
+    ppr05 = float(preds_05.mean())
+    tpr05 = float(labels[preds_05 == 1].mean()) if preds_05.sum() > 0 else 0.0
+
+    return {
+        "method":              method,
+        "seed":                seed,
+        "test_fold":           fold,
+        "n_edges":             len(scores),
+        "prevalence":          float(labels.mean()),
+        "reported_mcc":        rep_mcc,
+        "oracle_mcc":          orc_mcc,
+        "gap":                 orc_mcc - rep_mcc,
+        "auroc":               au_roc,
+        "auprc":               au_prc,
+        "pred_pos_rate_at_05": ppr05,
+        "true_pos_rate_at_05": tpr05,
+        "optimal_threshold":   best_t,
+        "reported_threshold":  0.5,
+        "_inf_file":           f_str,
+    }
+
+
+def build_calibration_table(inference_dir: Path, workers: int = 4) -> list:
+    """
+    Build calibration rows in parallel.
+    Each file is independent so we fan out to `workers` processes.
+    workers=1 falls back to single-process (useful for debugging).
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     files = sorted(inference_dir.glob("*.pt"))
-    log.info(f"Building calibration table from {len(files)} inference files …")
+    log.info(f"Building calibration table from {len(files)} files "
+             f"(workers={workers}) …")
 
-    for f in files:
-        try:
-            data = _load_inference_file(f)
-        except Exception as e:
-            log.warning(f"  Cannot load {f.name}: {e}")
-            continue
+    rows = []
+    if workers <= 1:
+        for f in files:
+            r = _metrics_for_file(str(f))
+            if r and "_error" not in r:
+                rows.append(r)
+                log.info(f"  {r['method']} s={r['seed']} fold={r['test_fold']}: "
+                         f"rep={r['reported_mcc']:.3f} oracle={r['oracle_mcc']:.3f} "
+                         f"gap={r['gap']:.3f} auroc={r['auroc']:.3f}")
+            elif r and "_error" in r:
+                log.warning(f"  Error on {Path(r['_file']).name}: {r['_error']}")
+        return rows
 
-        scores  = np.asarray(data["scores"],  dtype=np.float32)
-        labels  = data["labels"]
-        method  = data["method"]
-        seed    = data["seed"]
-        fold    = data["test_fold"]
+    futures = {}
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for f in files:
+            futures[ex.submit(_metrics_for_file, str(f))] = f.name
+        for fut in as_completed(futures):
+            fname = futures[fut]
+            try:
+                r = fut.result()
+            except Exception as e:
+                log.warning(f"  Worker error on {fname}: {e}")
+                continue
+            if r is None:
+                continue
+            if "_error" in r:
+                log.warning(f"  {Path(r['_file']).name}: {r['_error']}")
+                continue
+            rows.append(r)
+            log.info(f"  {r['method']} s={r['seed']} fold={r['test_fold']}: "
+                     f"rep={r['reported_mcc']:.3f} oracle={r['oracle_mcc']:.3f} "
+                     f"gap={r['gap']:.3f} auroc={r['auroc']:.3f}")
 
-        if len(scores) == 0 or len(np.unique(labels)) < 2:
-            log.warning(f"  Skipping {f.name}: degenerate labels")
-            continue
-
-        n_edges    = len(scores)
-        prevalence = float(labels.mean())
-        rep_mcc    = reported_mcc_at(scores, labels, 0.5)
-        orc_mcc, opt_t = oracle_mcc(scores, labels)
-        gap        = orc_mcc - rep_mcc
-        au_roc     = _auroc(labels, scores)
-        au_prc     = _auprc(labels, scores)
-        preds_05   = (scores >= 0.5).astype(int)
-        ppr05      = float(preds_05.mean())
-        tpr05      = float(labels[preds_05 == 1].mean()) if preds_05.sum() > 0 else 0.0
-
-        rows.append({
-            "method":              method,
-            "seed":                seed,
-            "test_fold":           fold,
-            "n_edges":             n_edges,
-            "prevalence":          prevalence,
-            "reported_mcc":        rep_mcc,
-            "oracle_mcc":          orc_mcc,
-            "gap":                 gap,
-            "auroc":               au_roc,
-            "auprc":               au_prc,
-            "pred_pos_rate_at_05": ppr05,
-            "true_pos_rate_at_05": tpr05,
-            "optimal_threshold":   opt_t,
-            "reported_threshold":  0.5,
-            "_inf_file":           str(f),   # internal reference, not written to CSV
-        })
-        log.info(f"  {method} s={seed} fold={fold}: "
-                 f"rep={rep_mcc:.3f} oracle={orc_mcc:.3f} "
-                 f"gap={gap:.3f} auroc={au_roc:.3f}")
-
+    rows.sort(key=lambda r: (r["method"], r["seed"], r["test_fold"]))
     return rows
 
 
@@ -826,6 +943,8 @@ def main():
                         default=["all"])
     parser.add_argument("--dev",       action="store_true")
     parser.add_argument("--skip-umap", action="store_true")
+    parser.add_argument("--workers",   type=int, default=4,
+                        help="Parallel workers for A.2 calibration table (default 4)")
     args = parser.parse_args()
 
     setup_logging()
@@ -844,7 +963,7 @@ def main():
             log.error(f"No inference files in {INFERENCE_DIR}. "
                       "Run extract_scores.py first.")
             sys.exit(1)
-        rows = build_calibration_table(INFERENCE_DIR)
+        rows = build_calibration_table(INFERENCE_DIR, workers=args.workers)
         save_calibration_table(rows, cal_path)
         inf_lookup = build_inference_lookup(INFERENCE_DIR)
     else:
