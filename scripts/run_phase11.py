@@ -463,106 +463,214 @@ def gap_summary(rows: list) -> dict:
 
 # ── A.4  Unsupervised threshold calibration ───────────────────────────────────
 
-def unsupervised_calibration(rows: list, gap_summary_: dict, out_csv: Path):
-    if gap_summary_["threshold_bottlenecked"] <= 5:
-        log.info("A.4: <6 threshold-bottlenecked pairs — skipping calibration")
-        return
+def _mcc_at_thresholds(scores: np.ndarray, labels: np.ndarray,
+                        thresholds: list) -> list:
+    """
+    Compute MCC at every threshold in `thresholds` with ONE sort + ONE
+    cumulative-sum pass.  O(E log E + n_thresholds) vs O(E × n_thresholds).
+    """
+    P  = float(labels.sum())
+    N_ = float(len(scores)) - P
+    if P == 0 or N_ == 0:
+        return [0.0] * len(thresholds)
 
+    order         = np.argsort(-scores)
+    sorted_scores = scores[order]                          # descending
+    cum_tp        = np.cumsum(labels[order].astype(np.float64))
+
+    results = []
+    for t in thresholds:
+        # k = number of edges predicted positive (score >= t)
+        # In a descending-sorted array, that is the leftmost index where
+        # sorted_scores < t, found via searchsorted on the negated array.
+        k = int(np.searchsorted(-sorted_scores, -float(t), side="right"))
+        if k == 0:
+            tp, fp = 0.0, 0.0
+        else:
+            tp = float(cum_tp[min(k - 1, len(cum_tp) - 1)])
+            fp = float(k) - tp
+        tn = N_ - fp
+        fn = P  - tp
+        d  = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+        mcc = (tp * tn - fp * fn) / np.sqrt(max(d, 1e-12)) if d > 0 else 0.0
+        results.append(float(mcc))
+    return results
+
+
+def _calibrate_file(f_str: str, rep_mcc: float, orc_mcc: float,
+                    method: str, seed: int, fold: str) -> list:
+    """
+    Compute all calibration MCCs for one high-gap inference file.
+    Top-level function so ProcessPoolExecutor can pickle it.
+    Returns list of row dicts.
+    """
+    import numpy as np
+    import torch
+    from pathlib import Path
     from sklearn.mixture import GaussianMixture
 
-    log.info("A.4: Running unsupervised threshold calibration …")
+    f = Path(f_str)
+    if not f.exists():
+        return []
 
-    def otsu_threshold(scores):
-        bins = np.linspace(scores.min(), scores.max(), 256)
-        hist, edges = np.histogram(scores, bins=bins)
-        total = hist.sum()
-        best_t, best_between = edges[0], -1.0
-        w0, mu0 = 0.0, 0.0
-        mu_total = float(np.average(edges[:-1], weights=hist + 1e-12))
-        for i, h in enumerate(hist):
-            p = h / total
-            w0 += p
-            w1  = 1.0 - w0
-            if w0 == 0 or w1 == 0:
-                continue
-            mu0 = (mu0 * (w0 - p) + edges[i] * p) / w0 if w0 > 0 else 0
-            mu1 = (mu_total - w0 * mu0) / w1
-            between = w0 * w1 * (mu0 - mu1) ** 2
-            if between > best_between:
-                best_between = between
-                best_t = edges[i]
-        return best_t
+    data   = torch.load(f, weights_only=False)
+    scores = np.asarray(data["scores"], dtype=np.float32)
+    labels = np.asarray(data["labels"], dtype=np.int64)
+    gap    = orc_mcc - rep_mcc
+    prevalence = float(labels.mean())
 
-    def gmm_threshold(scores):
-        gm = GaussianMixture(n_components=2, random_state=0, n_init=3)
-        gm.fit(scores.reshape(-1, 1))
-        return float(np.mean(gm.means_.flatten()))
+    # ── compute all calibration thresholds ──────────────────────────────────
+    thresholds = {}
 
-    out_rows = []
-    high_gap_rows = [r for r in rows if r["gap"] > 0.10]
-
-    for row in high_gap_rows:
-        # Load inference data via the stored file path
-        inf_path = Path(row.get("_inf_file", ""))
-        if not inf_path.exists():
+    # Otsu: O(256) histogram scan — fast regardless of E
+    bins = np.linspace(scores.min(), scores.max(), 256)
+    hist, edges = np.histogram(scores, bins=bins)
+    total = hist.sum()
+    w0 = mu0 = best_between = 0.0
+    best_t_otsu = float(edges[0])
+    mu_total = float(np.dot(edges[:-1], hist) / max(total, 1))
+    for i, h in enumerate(hist):
+        p = h / total
+        w0 += p
+        w1  = 1.0 - w0
+        if w0 <= 0 or w1 <= 0:
             continue
+        mu0 = (mu0 * (w0 - p) + edges[i] * p) / w0
+        mu1 = (mu_total - w0 * mu0) / w1
+        between = w0 * w1 * (mu0 - mu1) ** 2
+        if between > best_between:
+            best_between = between
+            best_t_otsu  = edges[i]
+    thresholds["otsu"] = best_t_otsu
 
-        data    = torch.load(inf_path, weights_only=False)
-        scores  = np.asarray(data["scores"], dtype=np.float32)
-        labels  = np.asarray(data["labels"],  dtype=np.int64)
-        rep_mcc = row["reported_mcc"]
-        orc_mcc = row["oracle_mcc"]
-        gap     = orc_mcc - rep_mcc
+    # GMM: subsample to 50 K for speed (fitting on 5 M samples was the killer)
+    try:
+        max_fit = 50_000
+        fit_sc  = scores if len(scores) <= max_fit else scores[
+            np.random.RandomState(0).choice(len(scores), max_fit, replace=False)]
+        gm = GaussianMixture(n_components=2, random_state=0, n_init=1)
+        gm.fit(fit_sc.reshape(-1, 1))
+        thresholds["gmm"] = float(np.mean(gm.means_.flatten()))
+    except Exception:
+        thresholds["gmm"] = float("nan")
 
-        calibrated = {}
-        try:
-            calibrated["otsu"] = _mcc(labels, (scores >= otsu_threshold(scores)).astype(int))
-        except Exception:
-            calibrated["otsu"] = float("nan")
-        try:
-            calibrated["gmm"]  = _mcc(labels, (scores >= gmm_threshold(scores)).astype(int))
-        except Exception:
-            calibrated["gmm"]  = float("nan")
+    # Top-k% and prevalence transfer: just percentile lookups
+    for k in [10, 20, 30, 40]:
+        thresholds[f"topk{k}"] = float(np.percentile(scores, 100 - k))
+    thresholds["prevalence_transfer"] = float(
+        np.percentile(scores, 100.0 * (1.0 - prevalence)))
 
-        prevalence = float(labels.mean())
-        for k in [10, 20, 30, 40]:
-            t = np.percentile(scores, 100 - k)
-            calibrated[f"topk{k}"] = _mcc(labels, (scores >= t).astype(int))
+    # ── one vectorised MCC pass for all valid thresholds ────────────────────
+    names      = list(thresholds.keys())
+    tvals      = [thresholds[n] for n in names]
+    valid_mask = [not (isinstance(v, float) and np.isnan(v)) for v in tvals]
 
-        t_prev = np.percentile(scores, 100 * (1.0 - prevalence))
-        calibrated["prevalence_transfer"] = _mcc(labels, (scores >= t_prev).astype(int))
+    # compute only for valid thresholds
+    valid_tvals = [v for v, ok in zip(tvals, valid_mask) if ok]
 
-        for cal_name, cal_mcc in calibrated.items():
-            rec = (cal_mcc - rep_mcc) / gap if (gap > 0 and not np.isnan(cal_mcc)) else float("nan")
-            out_rows.append({
-                "method": row["method"], "seed": row["seed"],
-                "test_fold": row["test_fold"],
-                "reported_mcc": rep_mcc, "oracle_mcc": orc_mcc, "gap": gap,
-                "cal_method": cal_name, "calibrated_mcc": cal_mcc,
-                "oracle_recovery": rec,
-            })
-            log.info(f"  {row['method']} {row['test_fold']} {cal_name}: "
-                     f"mcc={cal_mcc:.3f}  rec={rec:.3f}")
+    P  = float(labels.sum())
+    N_ = float(len(scores)) - P
+    if P > 0 and N_ > 0:
+        order         = np.argsort(-scores)
+        sorted_scores = scores[order]
+        cum_tp        = np.cumsum(labels[order].astype(np.float64))
+        mccs_valid = []
+        for t in valid_tvals:
+            k = int(np.searchsorted(-sorted_scores, -float(t), side="right"))
+            tp = float(cum_tp[min(k - 1, len(cum_tp) - 1)]) if k > 0 else 0.0
+            fp = float(k) - tp
+            tn = N_ - fp;  fn = P - tp
+            d  = (tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)
+            mccs_valid.append(
+                (tp*tn - fp*fn) / np.sqrt(max(d, 1e-12)) if d > 0 else 0.0)
+    else:
+        mccs_valid = [0.0] * len(valid_tvals)
 
-    cols = ["method", "seed", "test_fold", "reported_mcc", "oracle_mcc", "gap",
-            "cal_method", "calibrated_mcc", "oracle_recovery"]
+    # reconstruct full list with nan for invalid
+    vi = 0
+    mcc_map = {}
+    for name, ok in zip(names, valid_mask):
+        if ok:
+            mcc_map[name] = float(mccs_valid[vi]); vi += 1
+        else:
+            mcc_map[name] = float("nan")
+
+    # ── build output rows ────────────────────────────────────────────────────
+    out = []
+    for name, cal_mcc in mcc_map.items():
+        rec = (cal_mcc - rep_mcc) / gap if (gap > 0 and not np.isnan(cal_mcc)) \
+              else float("nan")
+        out.append({
+            "method": method, "seed": seed, "test_fold": fold,
+            "reported_mcc": rep_mcc, "oracle_mcc": orc_mcc, "gap": gap,
+            "cal_method": name, "calibrated_mcc": cal_mcc,
+            "oracle_recovery": rec,
+        })
+    return out
+
+
+def unsupervised_calibration(rows: list, gap_summary_: dict, out_csv: Path,
+                              workers: int = 4):
+    if gap_summary_["threshold_bottlenecked"] <= 5:
+        log.info("A.4: <6 threshold-bottlenecked pairs — skipping")
+        return
+
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    high_gap = [r for r in rows if r["gap"] > 0.10]
+    log.info(f"A.4: Calibrating {len(high_gap)} high-gap files "
+             f"(workers={workers}) …")
+
+    all_rows = []
+    if workers <= 1:
+        for r in high_gap:
+            inf_path = r.get("_inf_file", "")
+            sub = _calibrate_file(inf_path, r["reported_mcc"], r["oracle_mcc"],
+                                   r["method"], r["seed"], r["test_fold"])
+            for row in sub:
+                all_rows.append(row)
+                log.info(f"  {row['method']} {row['test_fold']} "
+                         f"{row['cal_method']}: mcc={row['calibrated_mcc']:.3f}"
+                         f"  rec={row['oracle_recovery']:.3f}")
+    else:
+        futures = {}
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for r in high_gap:
+                fut = ex.submit(_calibrate_file,
+                                r.get("_inf_file",""),
+                                r["reported_mcc"], r["oracle_mcc"],
+                                r["method"], r["seed"], r["test_fold"])
+                futures[fut] = r["method"]
+            for fut in as_completed(futures):
+                try:
+                    sub = fut.result()
+                except Exception as e:
+                    log.warning(f"  Worker error: {e}"); continue
+                for row in sub:
+                    all_rows.append(row)
+                    log.info(f"  {row['method']} {row['test_fold']} "
+                             f"{row['cal_method']}: mcc={row['calibrated_mcc']:.3f}"
+                             f"  rec={row['oracle_recovery']:.3f}")
+
+    cols = ["method","seed","test_fold","reported_mcc","oracle_mcc","gap",
+            "cal_method","calibrated_mcc","oracle_recovery"]
     with open(out_csv, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=cols).writeheader()
-        csv.DictWriter(f, fieldnames=cols).writerows(out_rows)
-    log.info(f"Saved → {out_csv}  ({len(out_rows)} rows)")
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader(); w.writerows(all_rows)
+    log.info(f"Saved → {out_csv}  ({len(all_rows)} rows)")
 
-    if out_rows:
+    if all_rows:
         by_cal: dict = defaultdict(list)
-        for r in out_rows:
+        for r in all_rows:
             v = r["oracle_recovery"]
             if not np.isnan(v):
                 by_cal[r["cal_method"]].append(v)
-        log.info("\nA.4 Recovery by calibration method (mean over high-gap pairs):")
+        log.info("\nA.4 Recovery by calibration method:")
         for cal, recs in sorted(by_cal.items(), key=lambda x: -np.mean(x[1])):
             m = np.mean(recs)
             log.info(f"  {cal:<22} mean_recovery={m:.3f}  n={len(recs)}")
             if m > 0.5:
-                log.info(f"    → >0.5 recovery consistently — publishable calibration result!")
+                log.info(f"    → >0.5 recovery — publishable calibration result!")
 
 
 # ── A.5  Per-attack-class oracle F1 ──────────────────────────────────────────
@@ -1001,7 +1109,9 @@ def main():
         log.info("\n=== A.4 Unsupervised calibration ===")
         if not summary:
             summary = gap_summary(rows)
-        unsupervised_calibration(rows, summary, RESULTS_DIR / "calibration_unsupervised.csv")
+        unsupervised_calibration(rows, summary,
+                                 RESULTS_DIR / "calibration_unsupervised.csv",
+                                 workers=args.workers)
 
     # ── A.5 ──────────────────────────────────────────────────────────────────
     if run_all or "A5" in parts:
