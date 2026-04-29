@@ -59,18 +59,20 @@ log = logging.getLogger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-FIGURES_DIR    = Path("results/figures/phase12")
-DELTA_SECS     = 60
-BETA_SWEEP     = [0.001, 0.01, 0.1]
-DEFAULT_BETA   = 0.01
-BETA_WARMUP    = 5
-MAX_EPOCHS     = 20
-PATIENCE       = 5
-BATCH_SIZE     = 2048
+FIGURES_DIR     = Path("results/figures/phase12")
+DELTA_SECS      = 60
+BETA_SWEEP      = [0.001, 0.01, 0.1]
+DEFAULT_BETA    = 0.01
+BETA_WARMUP     = 5
+MAX_EPOCHS      = 20
+PATIENCE        = 5
+BATCH_SIZE      = 2048
 MAX_TRAIN_EDGES = 200_000
-MAX_SUB_EDGES  = 1024
-NODE_FEAT_DIM  = 8
-N_JOBS         = 1
+MAX_VAL_EDGES   = 20_000    # pre-cached once; keep small so cache fits in RAM
+MAX_EVAL_EDGES  = 100_000   # stratified test-eval cap — prevents OOM on ton_iot
+MAX_SUB_EDGES   = 1024
+NODE_FEAT_DIM   = 8
+N_JOBS          = 4         # parallel subgraph extraction threads
 
 E8_1_AUROC_MEAN = 0.88   # from calibration table in spex12.md
 
@@ -381,13 +383,20 @@ def _train_ts_gib(
     patience: int = PATIENCE,
     batch_size: int = BATCH_SIZE,
     max_train_edges: int = MAX_TRAIN_EDGES,
+    max_val_edges: int = MAX_VAL_EDGES,
     warmup_epochs: int = BETA_WARMUP,
+    n_jobs: int = N_JOBS,
 ) -> dict:
     """
-    Train TS_GIB on `graph`.  Returns best state_dict.
+    Train TS_GIB on `graph`.  Returns (best_state_dict, p_src).
 
     domain_labels : [E_combined] tensor of source-domain integer labels (E12.3/E12.4).
     anomaly_scores: [E_combined] float32 numpy array of E6.2 scores (E12.2/E12.4).
+
+    Performance notes:
+      - Val subgraphs are extracted ONCE before the epoch loop and re-used every
+        epoch, eliminating repeated BFS for the fixed val split.
+      - n_jobs parallel threads are used for training-batch BFS extraction.
     """
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
@@ -403,20 +412,36 @@ def _train_ts_gib(
     ti_full, vi = _tts(np.arange(n), test_size=0.2, random_state=seed,
                        stratify=labels_np)
     ti_full = np.array(ti_full, dtype=np.int64)
-    vi      = np.array(vi, dtype=np.int64)
+    vi      = np.array(vi,      dtype=np.int64)
 
-    # Cap val so validation doesn't dominate wall time
-    max_val = max_train_edges // 4
-    if len(vi) > max_val:
-        vi = np.random.RandomState(seed + 999).choice(vi, max_val, replace=False)
+    # Cap val set — controls cache memory and per-epoch val cost
+    if len(vi) > max_val_edges:
+        rng_val = np.random.RandomState(seed + 999)
+        # Stratified subsample so attack rate is preserved for p_src
+        vi_lbl  = labels_np[vi]
+        _, vi_sub = _tts(vi, test_size=max_val_edges / len(vi),
+                         random_state=seed + 999, stratify=vi_lbl)
+        vi = np.array(vi_sub, dtype=np.int64)
 
-    # Source-val attack rate for calibrated evaluation
+    # Source-val attack rate used for calibrated MCC at test time
     p_src = float(labels_np[vi].mean())
     log.info(f"  train pool={len(ti_full):,}  val={len(vi):,}"
-             f"  p_src(attack rate)={p_src:.4f}")
+             f"  p_src={p_src:.4f}")
+
+    # ── Pre-cache validation subgraphs (once, reused every epoch) ────────────
+    log.info(f"  Pre-extracting {len(vi):,} val subgraphs (n_jobs={n_jobs}) …")
+    t_cache = time.time()
+    val_cache = batch_build_subgraphs(
+        src_np, dst_np, time_np,
+        src_np[vi], dst_np[vi], time_np[vi],
+        delta_us=delta_us, max_edges=max_edges,
+        node_feat_dim=NODE_FEAT_DIM, seed=seed, n_jobs=n_jobs,
+    )
+    log.info(f"  Val cache ready in {time.time() - t_cache:.1f}s")
 
     best_mcc, best_state, pat_cnt = -2.0, None, 0
     ep_rng = np.random.RandomState(seed)
+    use_domain = domain_labels is not None and model.domain_head is not None
 
     for epoch in range(epochs):
         beta = beta_max * min(1.0, (epoch + 1) / max(1, warmup_epochs))
@@ -425,7 +450,8 @@ def _train_ts_gib(
         # Stratified subsample of training edges for this epoch
         if len(ti_full) > max_train_edges:
             ep_labels = labels_np[ti_full]
-            ti_arr, _ = _tts(ti_full, test_size=1.0 - max_train_edges / len(ti_full),
+            ti_arr, _ = _tts(ti_full,
+                              test_size=1.0 - max_train_edges / len(ti_full),
                               random_state=ep_rng.randint(0, 2 ** 31),
                               stratify=ep_labels)
             ti_arr = np.array(ti_arr, dtype=np.int64)
@@ -434,19 +460,17 @@ def _train_ts_gib(
         ep_rng.shuffle(ti_arr)
 
         ep_loss, n_batches = 0.0, 0
-        use_domain = domain_labels is not None and model.domain_head is not None
 
         for start in range(0, len(ti_arr), batch_size):
-            ids   = ti_arr[start:start + batch_size]
-            yl    = torch.as_tensor(labels_np[ids], dtype=torch.long, device=device)
-            q_ea  = _make_q_ea(ids, device, anomaly_scores)
+            ids  = ti_arr[start:start + batch_size]
+            yl   = torch.as_tensor(labels_np[ids], dtype=torch.long, device=device)
+            q_ea = _make_q_ea(ids, device, anomaly_scores)
 
             data_list = batch_build_subgraphs(
                 src_np, dst_np, time_np,
                 src_np[ids], dst_np[ids], time_np[ids],
                 delta_us=delta_us, max_edges=max_edges,
-                node_feat_dim=NODE_FEAT_DIM, seed=seed,
-                n_jobs=N_JOBS,
+                node_feat_dim=NODE_FEAT_DIM, seed=seed, n_jobs=n_jobs,
             )
 
             if use_domain:
@@ -468,23 +492,16 @@ def _train_ts_gib(
             ep_loss  += loss.item()
             n_batches += 1
 
-        # ── Validation ──────────────────────────────────────────────────────
+        # ── Validation (uses pre-cached subgraphs) ───────────────────────────
         model.eval()
         all_preds = []
         for start in range(0, len(vi), batch_size):
-            ids   = vi[start:start + batch_size]
-            yl    = torch.as_tensor(labels_np[ids], dtype=torch.long, device=device)
-            q_ea  = _make_q_ea(ids, device, anomaly_scores)
+            ids      = vi[start:start + batch_size]
+            q_ea     = _make_q_ea(ids, device, anomaly_scores)
+            dl_slice = val_cache[start:start + batch_size]
             with torch.no_grad():
-                data_list = batch_build_subgraphs(
-                    src_np, dst_np, time_np,
-                    src_np[ids], dst_np[ids], time_np[ids],
-                    delta_us=delta_us, max_edges=max_edges,
-                    node_feat_dim=NODE_FEAT_DIM, seed=seed,
-                    n_jobs=N_JOBS,
-                )
                 logits, _ = _ts_gib_forward_batch(
-                    model, data_list, q_ea, device, use_domain=False)
+                    model, dl_slice, q_ea, device, use_domain=False)
             all_preds.append(logits.argmax(1).cpu().numpy())
 
         val_mcc = compute_mcc(labels_np[vi], np.concatenate(all_preds))
@@ -521,13 +538,19 @@ def _eval_ts_gib(
     anomaly_scores=None,
     max_edges: int = MAX_SUB_EDGES,
     batch_size: int = BATCH_SIZE,
+    max_eval_edges: int = MAX_EVAL_EDGES,
+    n_jobs: int = N_JOBS,
 ) -> dict:
     """
     Evaluate TS_GIB on graph.
 
+    Stratified-samples the test set to at most max_eval_edges edges, then
+    pre-extracts ALL subgraphs in one parallel call before batching.  This
+    prevents ton_iot (millions of edges) from running for hours.
+
     Returns dict with:
       y_true, y_pred, y_score,
-      reported_mcc (thresh=0.5), calibrated_mcc (top-k%), oracle_mcc,
+      reported_mcc, calibrated_mcc, oracle_mcc,
       calibration_methods (all strategies), auroc, auprc.
     """
     from sklearn.metrics import roc_auc_score, average_precision_score
@@ -535,20 +558,38 @@ def _eval_ts_gib(
     model.eval()
     src_np, dst_np, time_np = _graph_arrays(graph)
     labels_np = graph.edge_label.numpy()
-    n = len(labels_np)
+    n_total   = len(labels_np)
+
+    # Stratified cap so attack/benign ratio is preserved
+    if n_total > max_eval_edges:
+        _, eval_idx = _tts(
+            np.arange(n_total), test_size=max_eval_edges / n_total,
+            random_state=42, stratify=labels_np,
+        )
+        eval_idx = np.sort(np.array(eval_idx, dtype=np.int64))
+        log.info(f"  Test eval capped: {n_total:,} → {len(eval_idx):,} edges"
+                 f" (stratified, n_jobs={n_jobs})")
+    else:
+        eval_idx = np.arange(n_total, dtype=np.int64)
+
+    labels_eval = labels_np[eval_idx]
+
+    # Pre-extract ALL eval subgraphs in one parallel call
+    t0 = time.time()
+    all_data = batch_build_subgraphs(
+        src_np, dst_np, time_np,
+        src_np[eval_idx], dst_np[eval_idx], time_np[eval_idx],
+        delta_us=delta_us, max_edges=max_edges,
+        node_feat_dim=NODE_FEAT_DIM, seed=0, n_jobs=n_jobs,
+    )
+    log.info(f"  Test subgraph extraction: {time.time() - t0:.1f}s")
 
     all_preds, all_scores = [], []
-    for start in range(0, n, batch_size):
-        ids   = np.arange(start, min(start + batch_size, n))
-        q_ea  = _make_q_ea(ids, device, anomaly_scores)
-        data_list = batch_build_subgraphs(
-            src_np, dst_np, time_np,
-            src_np[ids], dst_np[ids], time_np[ids],
-            delta_us=delta_us, max_edges=max_edges,
-            node_feat_dim=NODE_FEAT_DIM, seed=0,
-            n_jobs=N_JOBS,
-        )
-        logits, _ = _ts_gib_forward_batch(model, data_list, q_ea, device)
+    for start in range(0, len(eval_idx), batch_size):
+        ids_batch = eval_idx[start:start + batch_size]
+        q_ea      = _make_q_ea(ids_batch, device, anomaly_scores)
+        dl_slice  = all_data[start:start + batch_size]
+        logits, _ = _ts_gib_forward_batch(model, dl_slice, q_ea, device)
         probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
         preds = logits.argmax(1).cpu().numpy()
         all_scores.append(probs)
@@ -557,19 +598,19 @@ def _eval_ts_gib(
     y_score = np.concatenate(all_scores)
     y_pred  = np.concatenate(all_preds)
 
-    reported_mcc              = compute_mcc(labels_np, y_pred)
-    calibrated_mcc, cal_t     = _calibrated_mcc(y_score, labels_np, p_src)
-    oracle_mcc_val, oracle_t  = _oracle_mcc(y_score, labels_np)
-    calibration_methods       = _all_calibration_mccs(y_score, labels_np, p_src)
+    reported_mcc              = compute_mcc(labels_eval, y_pred)
+    calibrated_mcc, cal_t     = _calibrated_mcc(y_score, labels_eval, p_src)
+    oracle_mcc_val, oracle_t  = _oracle_mcc(y_score, labels_eval)
+    calibration_methods       = _all_calibration_mccs(y_score, labels_eval, p_src)
 
     try:
-        auroc = float(roc_auc_score(labels_np, y_score))
-        auprc = float(average_precision_score(labels_np, y_score))
+        auroc = float(roc_auc_score(labels_eval, y_score))
+        auprc = float(average_precision_score(labels_eval, y_score))
     except Exception:
         auroc = auprc = float("nan")
 
     return {
-        "y_true":              labels_np,
+        "y_true":              labels_eval,
         "y_pred":              y_pred,
         "y_score":             y_score,
         "reported_mcc":        reported_mcc,
