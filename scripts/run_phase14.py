@@ -61,15 +61,16 @@ BETA_SWEEP = [10.0, 1.0, 0.1, 0.01]
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_fold_raw(fold: dict, dev: bool):
+def _load_fold_raw(fold: dict, dev: bool, tier: str = "B"):
     """
     Load fold with raw (un-encoded) edge features.
+    tier='A' → 4 shared features (byte_count, packet_count, tcp_flags_any, flow_duration_ms).
+    tier='B' → per-dataset full feature set, zero-padded to widest train dataset.
     Returns (combined, test_graph, feat_dim).
-    Aligns test edge_attr to training feat_dim by padding or cropping.
     """
-    train_graphs = [load_graph(ds, tier="B", dev=dev) for ds in fold["train"]]
+    train_graphs = [load_graph(ds, tier=tier, dev=dev) for ds in fold["train"]]
     combined     = combine_graphs(train_graphs)
-    test_graph   = load_graph(fold["test"], tier="B", dev=dev)
+    test_graph   = load_graph(fold["test"], tier=tier, dev=dev)
 
     feat_dim = combined.edge_attr.shape[1]
     d = test_graph.edge_attr.shape[1]
@@ -284,17 +285,18 @@ def _eval_e14(
 # Main experiment runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_e14(betas=None, seeds=None, dev=True, folds=None):
+def run_e14(betas=None, seeds=None, dev=True, folds=None, tier="B"):
     betas  = betas or BETA_SWEEP
     seeds  = seeds or [0]
     folds  = folds or ALL_FOLDS
     du     = _delta_us(DELTA_SECS)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    tier_tag = "tA" if tier == "A" else "tB"
 
-    log.info(f"=== E14  TS-GIB raw context+query  β sweep={betas}  seeds={seeds} ===")
+    log.info(f"=== E14  TS-GIB raw context+query  tier={tier}  β sweep={betas}  seeds={seeds} ===")
 
     for beta in betas:
-        exp_id = f"E14_ts_gib_rawctx_b{beta}"
+        exp_id = f"E14_ts_gib_rawctx_{tier_tag}_b{beta}"
         log.info(f"\n{'='*60}")
         log.info(f"  β = {beta}  exp_id = {exp_id}")
 
@@ -311,7 +313,7 @@ def run_e14(betas=None, seeds=None, dev=True, folds=None):
                 t0 = time.time()
                 log.info(f"\n  seed={seed}  test={test_dset}  β={beta}")
 
-                combined, test_graph, feat_dim = _load_fold_raw(fold, dev)
+                combined, test_graph, feat_dim = _load_fold_raw(fold, dev, tier=tier)
                 feat_np_train = combined.edge_attr.numpy().astype(np.float32)
                 feat_np_test  = test_graph.edge_attr.numpy().astype(np.float32)
                 log.info(f"  feat_dim={feat_dim}  "
@@ -406,10 +408,14 @@ def print_comparison_table(seeds=None):
     ROWS = [
         ("E12.1 struct-only b0.01",     "E12.1_ts_gib_b0.01"),
         ("E13.1 quant-query b0.01",     "E13.1_ts_gib_raw_b0.01"),
-        ("E14 raw-ctx b10",             "E14_ts_gib_rawctx_b10.0"),
-        ("E14 raw-ctx b1",              "E14_ts_gib_rawctx_b1.0"),
-        ("E14 raw-ctx b0.1",            "E14_ts_gib_rawctx_b0.1"),
-        ("E14 raw-ctx b0.01",           "E14_ts_gib_rawctx_b0.01"),
+        ("E14 tB raw-ctx b10",          "E14_ts_gib_rawctx_tB_b10.0"),
+        ("E14 tB raw-ctx b1",           "E14_ts_gib_rawctx_tB_b1.0"),
+        ("E14 tB raw-ctx b0.1",         "E14_ts_gib_rawctx_tB_b0.1"),
+        ("E14 tB raw-ctx b0.01",        "E14_ts_gib_rawctx_tB_b0.01"),
+        ("E14 tA raw-ctx b10",          "E14_ts_gib_rawctx_tA_b10.0"),
+        ("E14 tA raw-ctx b1",           "E14_ts_gib_rawctx_tA_b1.0"),
+        ("E14 tA raw-ctx b0.1",         "E14_ts_gib_rawctx_tA_b0.1"),
+        ("E14 tA raw-ctx b0.01",        "E14_ts_gib_rawctx_tA_b0.01"),
     ]
     FOLDS = ["lycos_ids2017", "cic_ids2018", "unsw_nb15", "ton_iot"]
 
@@ -447,8 +453,10 @@ def main():
     parser.add_argument("--seeds",  nargs="+", type=int, default=None)
     parser.add_argument("--folds",  nargs="+", default=None,
                         help="Restrict to these test datasets")
-    parser.add_argument("--no-dev", dest="dev", action="store_false")
-    parser.add_argument("--table",  action="store_true",
+    parser.add_argument("--no-dev",  dest="dev", action="store_false")
+    parser.add_argument("--tier-a",  dest="tier_a", action="store_true",
+                        help="Use tier-A (4 shared features) instead of tier-B (per-dataset)")
+    parser.add_argument("--table",   action="store_true",
                         help="Print comparison table and exit")
     args = parser.parse_args()
 
@@ -467,6 +475,7 @@ def main():
         seeds=args.seeds or [0],
         dev=args.dev,
         folds=run_folds,
+        tier="A" if args.tier_a else "B",
     )
 
 
