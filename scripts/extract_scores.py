@@ -24,6 +24,7 @@ import gc
 import logging
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -151,24 +152,34 @@ def parse_ckpt(stem: str):
 def detect_arch(sd):
     keys = set(sd.keys())
     if any(k.startswith("experts.") for k in keys): return "moe"
+    # TS_GIB uses ctx_enc (not edge_enc) — must check before generic "gib"
+    if "ctx_enc.0.weight" in keys:                  return "ts_gib"
     if "to_dist.weight" in keys:                    return "gib"
     if "encoder.edge_enc.0.weight" in keys:         return "dann"
+    # TemporalEdgeSAGE has edge_enc + norm1 (LayerNorm); plain SAGE does not
+    if "edge_enc.0.weight" in keys and "norm1.weight" in keys: return "ts_sage"
     if "edge_enc.0.weight" in keys:                 return "sage"
     return "unknown"
 
 def _get_edge_in(sd, arch):
+    if arch == "ts_gib":       return sd["ctx_enc.0.weight"].shape[1]   # ctx_edge_in (always 1)
+    if arch == "ts_sage":      return sd["edge_enc.0.weight"].shape[1]
     if arch in ("sage","gib"): return sd["edge_enc.0.weight"].shape[1]
     if arch == "dann":         return sd["encoder.edge_enc.0.weight"].shape[1]
     if arch == "moe":          return sd["experts.0.edge_enc.0.weight"].shape[1]
     return 1
 
 def _get_hidden(sd, arch):
+    if arch == "ts_gib":       return sd["ctx_enc.0.weight"].shape[0]
+    if arch == "ts_sage":      return sd["edge_enc.0.weight"].shape[0]
     if arch in ("sage","gib"): return sd["edge_enc.0.weight"].shape[0]
     if arch == "dann":         return sd["encoder.edge_enc.0.weight"].shape[0]
     if arch == "moe":          return sd["experts.0.edge_enc.0.weight"].shape[0]
     return 128
 
 def _get_node_in(sd, arch, hidden):
+    if arch in ("ts_gib", "ts_sage"):
+                               return sd["conv1.lin_l.weight"].shape[1] - hidden
     if arch in ("sage","gib"): return sd["conv1.lin_l.weight"].shape[1] - hidden
     if arch == "dann":         return sd["encoder.conv1.lin_l.weight"].shape[1] - hidden
     if arch == "moe":          return sd["experts.0.conv1.lin_l.weight"].shape[1] - hidden
@@ -282,6 +293,160 @@ def _get_graph_tensors(g, edge_in, method, dev, device):
     return x, ei, ea, labels_np, ac_ids
 
 
+# ── temporal processors ───────────────────────────────────────────────────────
+
+def _anom_scores_for_temporal(test_fold: str, seed: int, dev: bool, device: str):
+    """
+    Load E6.2 MSA encoder + IsolationForest and score test-graph edges.
+    Returns float32 [E_test] array, or None if artifacts are missing.
+    Used for E12.2 / E13.1 checkpoints that append anomaly score to q_ea.
+    """
+    enc_path = MODELS_DIR / f"E6.2_msa_encoder_seed{seed}_test{test_fold}.pt"
+    if_path  = MODELS_DIR / f"E6.2_msa_if_seed{seed}_test{test_fold}.pt"
+    if not enc_path.exists() or not if_path.exists():
+        log.warning(f"  E6.2 artifacts missing for seed={seed} test={test_fold}")
+        return None
+    try:
+        enc_sd  = torch.load(enc_path, weights_only=True)
+        enc_ein = enc_sd["edge_enc.0.weight"].shape[1]
+        enc_h   = enc_sd["edge_enc.0.weight"].shape[0]
+        enc_nin = enc_sd["conv1.lin_l.weight"].shape[1] - enc_h
+        encoder = EdgeAwareSAGE(node_in=enc_nin, edge_in=enc_ein, hidden=enc_h)
+        encoder.load_state_dict(enc_sd); del enc_sd
+        encoder.eval().to(device)
+        iforest = torch.load(if_path, weights_only=False)
+        g_a   = _load_cached_graph(test_fold, "A", dev)
+        x_a   = g_a.x.to(device)
+        ei_a  = g_a.edge_index.to(device)
+        ea_a  = g_a.edge_attr_q.to(device)
+        scores = _anomaly_scores_batched(encoder, iforest, x_a, ei_a, ea_a, device)
+        del encoder, iforest, x_a, ei_a, ea_a
+        return scores.astype(np.float32)
+    except Exception as exc:
+        log.warning(f"  Failed to compute anomaly scores: {exc}")
+        return None
+
+
+@torch.no_grad()
+def process_temporal(ckpt_path, info, dev, device):
+    """
+    Score extraction for temporal models:
+      ts_gib  — TS_GIB (E12.x, E13.1-2) with optional variational bottleneck
+      ts_sage — TemporalEdgeSAGE (E8.x)
+
+    Builds temporal subgraphs from the test graph using structure-only edge
+    features (constant 1.0), matching the training convention of these models.
+    For checkpoints with a separate query encoder (E12.2 / E13.1), loads E6.2
+    anomaly scores and appends them to the query-edge feature tensor.
+    """
+    from run_phase12 import (
+        _graph_arrays, _delta_us,
+        DELTA_SECS, BATCH_SIZE, MAX_EVAL_EDGES, MAX_SUB_EDGES, NODE_FEAT_DIM, N_JOBS,
+    )
+    from src.data.temporal_subgraph import batch_build_subgraphs
+    from src.models.temporal_gnn import TS_GIB, TemporalEdgeSAGE
+    from torch_geometric.data import Batch as _Batch
+    from sklearn.model_selection import train_test_split as _tts
+
+    test_fold = info["test_fold"]
+    seed      = info["seed"]
+
+    state = torch.load(ckpt_path, weights_only=True)
+    keys  = set(state.keys())
+    arch  = detect_arch(state)
+
+    # ── Reconstruct model ───────────────────────────────────────────────────
+    if arch == "ts_gib":
+        hidden    = state["ctx_enc.0.weight"].shape[0]
+        node_in   = state["conv1.lin_l.weight"].shape[1] - hidden
+        has_q_enc = any(k.startswith("q_enc.") for k in keys)
+        q_edge_in = state["q_enc.0.weight"].shape[1] if has_q_enc else 1
+        use_bn    = "to_dist.weight" in keys
+        dom_w     = state.get("domain_head.2.weight")
+        num_doms  = dom_w.shape[0] if dom_w is not None else 0
+        model     = TS_GIB(node_in=node_in, ctx_edge_in=1, q_edge_in=q_edge_in,
+                           hidden=hidden, use_bottleneck=use_bn, num_domains=num_doms)
+    else:  # ts_sage — TemporalEdgeSAGE
+        edge_in = state["edge_enc.0.weight"].shape[1]
+        hidden  = state["edge_enc.0.weight"].shape[0]
+        node_in = state["conv1.lin_l.weight"].shape[1] - hidden
+        model   = TemporalEdgeSAGE(node_in=node_in, edge_in=edge_in, hidden=hidden)
+        q_edge_in = edge_in
+
+    model.load_state_dict(state); del state
+    model.eval().to(device)
+
+    # ── Load test graph (structure-only) ────────────────────────────────────
+    g         = _load_cached_graph(test_fold, "B", dev)
+    E_all     = g.edge_attr.shape[0]
+    src_np, dst_np, time_np = _graph_arrays(g)
+    labels_np = g.edge_label.numpy().copy()
+    ac_ids    = _encode_ac(g.edge_label_type)
+
+    # ── Stratified test cap ─────────────────────────────────────────────────
+    n_total = len(labels_np)
+    if n_total > MAX_EVAL_EDGES:
+        _, eval_idx = _tts(np.arange(n_total),
+                           test_size=MAX_EVAL_EDGES / n_total,
+                           random_state=42, stratify=labels_np)
+        eval_idx  = np.sort(np.array(eval_idx, dtype=np.int64))
+        labels_np = labels_np[eval_idx]
+        ac_ids    = ac_ids[eval_idx]
+        log.info(f"  Test capped: {n_total:,} → {len(eval_idx):,}")
+    else:
+        eval_idx = np.arange(n_total, dtype=np.int64)
+
+    # ── Anomaly scores for E12.2 / E13.1 (q_edge_in > 1) ───────────────────
+    anom_np = None
+    if arch == "ts_gib" and q_edge_in == 2:
+        anom_np = _anom_scores_for_temporal(test_fold, seed, dev, device)
+        if anom_np is None:
+            log.warning(f"  Falling back to zeros for anomaly q_ea")
+            anom_np = np.zeros(E_all, dtype=np.float32)
+
+    # ── Pre-extract all subgraphs ────────────────────────────────────────────
+    du = _delta_us(DELTA_SECS)
+    log.info(f"  Extracting {len(eval_idx):,} temporal subgraphs (n_jobs={N_JOBS}) …")
+    t0 = time.time()
+    all_data = batch_build_subgraphs(
+        src_np, dst_np, time_np,
+        src_np[eval_idx], dst_np[eval_idx], time_np[eval_idx],
+        delta_us=du, max_edges=MAX_SUB_EDGES,
+        node_feat_dim=NODE_FEAT_DIM, seed=0, n_jobs=N_JOBS,
+    )
+    log.info(f"  Subgraph extraction done in {time.time()-t0:.1f}s")
+
+    # ── Batched inference ────────────────────────────────────────────────────
+    all_scores = []
+    for start in range(0, len(eval_idx), BATCH_SIZE):
+        ids_b = eval_idx[start:start + BATCH_SIZE]
+        B_    = len(ids_b)
+
+        # Query-edge features
+        if anom_np is not None:
+            a    = torch.as_tensor(anom_np[ids_b], dtype=torch.float32, device=device)
+            q_ea = torch.stack([torch.ones(B_, device=device), a], dim=-1)
+        else:
+            q_ea = torch.ones(B_, q_edge_in, device=device)
+
+        # Batch subgraphs and recover global src/dst indices
+        dl    = all_data[start:start + BATCH_SIZE]
+        batch = _Batch.from_data_list([d.to(device) for d in dl])
+        ptr   = batch.ptr.to(device)
+        u_globals = torch.tensor([d.query_u for d in dl],
+                                  dtype=torch.long, device=device) + ptr[:-1]
+        v_globals = torch.tensor([d.query_v for d in dl],
+                                  dtype=torch.long, device=device) + ptr[:-1]
+
+        out    = model(batch.x, batch.edge_index, batch.edge_attr,
+                       u_globals, v_globals, q_ea)
+        logits = out[0] if isinstance(out, tuple) else out
+        all_scores.append(F.softmax(logits, dim=-1)[:, 1].cpu().numpy())
+
+    del model, all_data
+    return np.concatenate(all_scores).astype(np.float32), labels_np, ac_ids
+
+
 # ── processors ───────────────────────────────────────────────────────────────
 
 _current_fold = None   # set in main loop so helpers can read it
@@ -315,6 +480,11 @@ def process_main(ckpt_path, info, dev, device):
     if arch == "unknown":
         log.warning(f"  Unknown arch: {ckpt_path.name}")
         del sd; return None
+
+    # Temporal models need subgraph extraction — delegate to dedicated handler
+    if arch in ("ts_gib", "ts_sage"):
+        del sd
+        return process_temporal(ckpt_path, info, dev, device)
 
     method    = info["method"]
     test_fold = info["test_fold"]
