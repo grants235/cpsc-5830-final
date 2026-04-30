@@ -103,6 +103,7 @@ def build_subgraph_data(
     query_u: int,
     query_v: int,
     node_feat_dim: int = 8,
+    edge_attr_np: np.ndarray | None = None,
 ) -> Data:
     """
     Build a PyG Data object for a single temporal context subgraph.
@@ -112,7 +113,9 @@ def build_subgraph_data(
     subgraph are stored as data.query_u / data.query_v for retrieval after
     PyG Batch stacking.
 
-    Edge features are constant 1.0 (structure-only, matching E1.E).
+    If edge_attr_np is None, context edge features are constant 1.0 (structure-only).
+    If edge_attr_np is provided (shape [E_total, F]), context edges use the
+    corresponding rows (indexed by global_idx) as their features.
     """
     if len(global_idx) > 0:
         sub_src = src_np[global_idx]
@@ -134,7 +137,14 @@ def build_subgraph_data(
     E  = len(global_idx)
     ei = torch.as_tensor(np.stack([local_src, local_dst]) if E > 0
                          else np.zeros((2, 0), dtype=np.int64), dtype=torch.long)
-    ea = torch.ones(E, 1, dtype=torch.float32)
+
+    if edge_attr_np is not None:
+        feat_dim = edge_attr_np.shape[1]
+        ea = (torch.as_tensor(edge_attr_np[global_idx], dtype=torch.float32)
+              if E > 0 else torch.zeros(0, feat_dim, dtype=torch.float32))
+    else:
+        ea = torch.ones(E, 1, dtype=torch.float32)
+
     x  = torch.ones(N, node_feat_dim, dtype=torch.float32)
 
     data         = Data(x=x, edge_index=ei, edge_attr=ea)
@@ -155,12 +165,15 @@ def batch_build_subgraphs(
     node_feat_dim: int = 8,
     seed: int = 0,
     n_jobs: int = 4,
+    edge_attr_np: np.ndarray | None = None,
 ) -> list:
     """
     Build a list of Data objects for a batch of query edges.
     Returned list has the same length as query_u_arr.
 
     n_jobs: worker threads for parallel extraction (NumPy releases the GIL).
+    edge_attr_np: if provided (shape [E_total, F]), context edges use real features
+                  instead of the default constant 1.0.
     """
     n    = len(query_u_arr)
     rng  = np.random.RandomState(seed)
@@ -178,6 +191,7 @@ def batch_build_subgraphs(
             src_np, dst_np, gidx,
             int(query_u_arr[i]), int(query_v_arr[i]),
             node_feat_dim=node_feat_dim,
+            edge_attr_np=edge_attr_np,
         )
 
     if n_jobs > 1 and n > 1:
