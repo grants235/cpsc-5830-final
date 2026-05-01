@@ -143,15 +143,12 @@ def _val_scores_temporal(ckpt_path: Path, fold: dict, seed: int,
 
     if is_ts_gib:
         has_q_enc = any(k.startswith("q_enc.") for k in state)
-        q_edge_in = 2 if has_q_enc else 1
+        q_edge_in = state["q_enc.0.weight"].shape[1] if has_q_enc else 1
         use_bn    = "to_dist.weight" in state
         dom_w     = state.get("domain_head.2.weight")
         num_doms  = dom_w.shape[0] if dom_w is not None else 0
         model     = TS_GIB(node_in=NODE_FEAT_DIM, ctx_edge_in=1, q_edge_in=q_edge_in,
                            hidden=128, use_bottleneck=use_bn, num_domains=num_doms)
-        # E12.2/E12.4 need q_edge_in=2; fall back to zeros when no scores supplied.
-        if q_edge_in == 2 and anomaly_scores_train is None:
-            anomaly_scores_train = np.zeros(len(labels_np), dtype=np.float32)
     else:  # TemporalEdgeSAGE (E8.x / E9.x)
         edge_in   = state["edge_enc.0.weight"].shape[1]
         hidden    = state["edge_enc.0.weight"].shape[0]
@@ -162,13 +159,33 @@ def _val_scores_temporal(ckpt_path: Path, fold: dict, seed: int,
     model.load_state_dict(state)
     model.eval().to(device)
 
+    # Determine how to build q_ea for each batch:
+    #   q_edge_in=1  → constant 1.0  (E12.1, E12.3, E8.x, E9.x)
+    #   q_edge_in=2  → [1.0, anomaly_score]  (E12.2, E12.4)
+    #   q_edge_in>2  → real quantile features  (E13.1 and similar)
+    feat_q_np = None   # raw query features array, used when q_edge_in > 2
+    if q_edge_in == 2 and anomaly_scores_train is None:
+        anomaly_scores_train = np.zeros(len(labels_np), dtype=np.float32)
+    elif q_edge_in > 2:
+        combined_raw, _, _, _, _ = _load_fold_raw(fold, dev)
+        feat_q_np = combined_raw.edge_attr_q.numpy().astype(np.float32)
+        d = feat_q_np.shape[1]
+        if d < q_edge_in:
+            feat_q_np = np.concatenate(
+                [feat_q_np, np.zeros((len(feat_q_np), q_edge_in - d), dtype=np.float32)], axis=1)
+        elif d > q_edge_in:
+            feat_q_np = feat_q_np[:, :q_edge_in]
+
     src_np, dst_np, time_np = _graph_arrays(combined)
     du = _delta_us(DELTA_SECS)
 
     all_scores, all_preds = [], []
     for start in range(0, len(vi), BATCH_SIZE):
         ids   = vi[start:start + BATCH_SIZE]
-        q_ea  = _make_q_ea_val(ids, device, anomaly_scores_train)
+        if feat_q_np is not None:
+            q_ea = _make_q_ea_raw(ids, feat_q_np, device)
+        else:
+            q_ea = _make_q_ea_val(ids, device, anomaly_scores_train)
         data_list = batch_build_subgraphs(
             src_np, dst_np, time_np,
             src_np[ids], dst_np[ids], time_np[ids],
