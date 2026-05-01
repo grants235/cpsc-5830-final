@@ -692,10 +692,20 @@ def run_a1_calibration_sweep(target_exps: list = None, dev: bool = True):
                                 m = EdgeAwareSAGE(node_in=test_graph.x.shape[1],
                                                   edge_in=ck_edge_in)
                             m.load_state_dict(state)
-                            res = eval_egraphsage(m, test_graph, device=device,
-                                                  use_quantile=use_q)
-                            test_scores = res["y_score"].astype(np.float32)
-                            test_labels = res["y_true"]
+                            m.eval().to(device)
+                            # Use pre-cropped ea directly — eval_egraphsage would
+                            # re-read test_graph.edge_attr and ignore the crop.
+                            x_t  = test_graph.x.to(device)
+                            ei_t = test_graph.edge_index.to(device)
+                            ea_t = ea.to(device)
+                            ts_scores, ts_preds = [], []
+                            with torch.no_grad():
+                                for s in range(0, ei_t.shape[1], 50_000):
+                                    lg = m(x_t, ei_t[:, s:s+50_000], ea_t[s:s+50_000])
+                                    ts_scores.append(
+                                        torch.softmax(lg, dim=-1)[:, 1].cpu().numpy())
+                            test_scores = np.concatenate(ts_scores).astype(np.float32)
+                            test_labels = test_graph.edge_label.numpy()
                             val_scores, val_labels = vs_standard, vl_standard
                         except Exception as e:
                             log.warning(f"  Failed: {e}")
