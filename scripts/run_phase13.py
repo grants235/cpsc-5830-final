@@ -257,6 +257,93 @@ def _val_scores_standard(ckpt_path: Path, fold: dict, seed: int,
     return np.concatenate(all_scores).astype(np.float32), labels_np[vi]
 
 
+@torch.no_grad()
+def _test_scores_temporal(ckpt_path: Path, fold: dict, dev: bool, device: str) -> tuple:
+    """
+    Re-run test inference for a temporal checkpoint (TS_GIB or TemporalEdgeSAGE).
+    Mirrors _val_scores_temporal but runs on the test graph.
+    Returns (test_scores [N], test_labels [N]) or (None, None) on failure.
+    """
+    if not ckpt_path.exists():
+        return None, None
+
+    state     = torch.load(ckpt_path, weights_only=True)
+    is_ts_gib = "ctx_enc.0.weight" in state
+
+    if is_ts_gib:
+        has_q_enc = any(k.startswith("q_enc.") for k in state)
+        q_edge_in = state["q_enc.0.weight"].shape[1] if has_q_enc else 1
+        use_bn    = "to_dist.weight" in state
+        dom_w     = state.get("domain_head.2.weight")
+        num_doms  = dom_w.shape[0] if dom_w is not None else 0
+        model     = TS_GIB(node_in=NODE_FEAT_DIM, ctx_edge_in=1, q_edge_in=q_edge_in,
+                           hidden=128, use_bottleneck=use_bn, num_domains=num_doms)
+    else:
+        edge_in   = state["edge_enc.0.weight"].shape[1]
+        hidden    = state["edge_enc.0.weight"].shape[0]
+        node_in   = state["conv1.lin_l.weight"].shape[1] - hidden
+        q_edge_in = edge_in
+        model     = TemporalEdgeSAGE(node_in=node_in, edge_in=edge_in, hidden=hidden)
+
+    model.load_state_dict(state)
+    model.eval().to(device)
+
+    # Load test graph; real quantile features needed only for q_edge_in > 2 (E13.1)
+    feat_q_np = None
+    anom_np   = None
+    if is_ts_gib and q_edge_in > 2:
+        _, test_graph, _, _, _ = _load_fold_raw(fold, dev)
+        feat_q_np = test_graph.edge_attr_q.numpy().astype(np.float32)
+        d = feat_q_np.shape[1]
+        if d < q_edge_in:
+            feat_q_np = np.concatenate(
+                [feat_q_np, np.zeros((len(feat_q_np), q_edge_in - d), dtype=np.float32)], axis=1)
+        elif d > q_edge_in:
+            feat_q_np = feat_q_np[:, :q_edge_in]
+    else:
+        _, test_graph, _, _ = _load_fold_struct(fold, dev)
+        if is_ts_gib and q_edge_in == 2:
+            anom_np = np.zeros(test_graph.edge_label.shape[0], dtype=np.float32)
+
+    src_np, dst_np, time_np = _graph_arrays(test_graph)
+    labels_np = test_graph.edge_label.numpy()
+    n_total   = len(labels_np)
+    du        = _delta_us(DELTA_SECS)
+
+    if n_total > MAX_EVAL_EDGES:
+        _, eval_idx = _tts(np.arange(n_total),
+                           test_size=MAX_EVAL_EDGES / n_total,
+                           random_state=42, stratify=labels_np)
+        eval_idx = np.sort(np.array(eval_idx, dtype=np.int64))
+        log.info(f"  Test capped: {n_total:,} → {len(eval_idx):,}")
+    else:
+        eval_idx = np.arange(n_total, dtype=np.int64)
+
+    log.info(f"  Extracting {len(eval_idx):,} test subgraphs (n_jobs={N_JOBS}) …")
+    t0       = time.time()
+    all_data = batch_build_subgraphs(
+        src_np, dst_np, time_np,
+        src_np[eval_idx], dst_np[eval_idx], time_np[eval_idx],
+        delta_us=du, max_edges=MAX_SUB_EDGES,
+        node_feat_dim=NODE_FEAT_DIM, seed=0, n_jobs=N_JOBS,
+    )
+    log.info(f"  Subgraph extraction: {time.time()-t0:.1f}s")
+
+    all_scores = []
+    for start in range(0, len(eval_idx), BATCH_SIZE):
+        ids_b = eval_idx[start:start + BATCH_SIZE]
+        if feat_q_np is not None:
+            q_ea = _make_q_ea_raw(ids_b, feat_q_np, device)
+        else:
+            q_ea = _make_q_ea_val(ids_b, device, anom_np)
+        dl     = all_data[start:start + BATCH_SIZE]
+        out    = _ts_gib_forward_batch(model, dl, q_ea, device)
+        logits = out[0] if isinstance(out, tuple) else out
+        all_scores.append(torch.softmax(logits, dim=-1)[:, 1].cpu().numpy())
+
+    return np.concatenate(all_scores).astype(np.float32), labels_np[eval_idx]
+
+
 def _make_q_ea_val(ids: np.ndarray, device: str,
                     anomaly_scores=None) -> torch.Tensor:
     """Query-edge features for val inference (mirrors run_phase12._make_q_ea)."""
@@ -560,42 +647,59 @@ def run_a1_calibration_sweep(target_exps: list = None, dev: bool = True):
                 inf_data = _load_inference_file(inf_path)
 
                 if inf_data is None:
-                    # Re-run test inference on the fly (non-temporal only for speed)
                     if temporal:
-                        log.info(f"  No inference file; skipping temporal re-inference "
-                                  f"for {exp_id} (run extract_scores.py first)")
-                        continue
-                    log.info(f"  No inference file; running batch inference …")
-                    try:
-                        vs_standard, vl_standard = _val_scores_standard(
-                            ckpt, fold, seed, exp_id, dev, device)
-                        if vs_standard is None:
+                        log.info(f"  No inference file; computing test scores on the fly …")
+                        try:
+                            test_scores, test_labels = _test_scores_temporal(
+                                ckpt, fold, dev, device)
+                            if test_scores is None:
+                                continue
+                            beta = float(exp_id.split("_b")[-1]) if "_b" in exp_id else DEFAULT_BETA_13
+                            log.info(f"  Computing val scores (temporal, n_jobs={N_JOBS}) …")
+                            val_scores, val_labels = _val_scores_temporal(
+                                ckpt, fold, seed, beta, dev, device)
+                        except Exception as e:
+                            log.warning(f"  Failed: {e}")
                             continue
-                        # For test, load via eval_egraphsage
-                        use_q = not any(x in exp_id for x in
-                                        ("E1.E", "struct", "nofeat"))
-                        _, test_graph = _load_fold_real(fold, dev, use_quantile=use_q)
-                        is_gib = any("to_dist" in k for k in
-                                     torch.load(ckpt, weights_only=True))
-                        from src.models.egraphsage import EdgeAwareSAGE
-                        state = torch.load(ckpt, weights_only=True)
-                        ea    = (test_graph.edge_attr_q if use_q
-                                 else test_graph.edge_attr)
-                        if is_gib:
-                            m = GIB_EGraphSAGE(node_in=test_graph.x.shape[1],
-                                               edge_in=ea.shape[1])
-                        else:
-                            m = EdgeAwareSAGE(node_in=test_graph.x.shape[1],
-                                              edge_in=ea.shape[1])
-                        m.load_state_dict(state)
-                        res = eval_egraphsage(m, test_graph, device=device,
-                                              use_quantile=use_q)
-                        test_scores = res["y_score"].astype(np.float32)
-                        test_labels = res["y_true"]
-                        val_scores, val_labels = vs_standard, vl_standard
-                    except Exception as e:
-                        log.warning(f"  Failed: {e}")
-                        continue
+                    else:
+                        log.info(f"  No inference file; running batch inference …")
+                        try:
+                            vs_standard, vl_standard = _val_scores_standard(
+                                ckpt, fold, seed, exp_id, dev, device)
+                            if vs_standard is None:
+                                continue
+                            use_q = not any(x in exp_id for x in
+                                            ("E1.E", "struct", "nofeat"))
+                            _, test_graph = _load_fold_real(fold, dev, use_quantile=use_q)
+                            state = torch.load(ckpt, weights_only=True)
+                            ck_key = ("encoder.edge_enc.0.weight"
+                                      if "encoder.edge_enc.0.weight" in state
+                                      else "edge_enc.0.weight")
+                            ck_edge_in = state[ck_key].shape[1]
+                            ea = (test_graph.edge_attr_q if use_q else test_graph.edge_attr)
+                            if ea.shape[1] != ck_edge_in:
+                                if ea.shape[1] < ck_edge_in:
+                                    pad = torch.zeros(ea.shape[0], ck_edge_in - ea.shape[1])
+                                    ea  = torch.cat([ea, pad], dim=1)
+                                else:
+                                    ea = ea[:, :ck_edge_in]
+                            is_gib = any("to_dist" in k for k in state)
+                            from src.models.egraphsage import EdgeAwareSAGE
+                            if is_gib:
+                                m = GIB_EGraphSAGE(node_in=test_graph.x.shape[1],
+                                                   edge_in=ck_edge_in)
+                            else:
+                                m = EdgeAwareSAGE(node_in=test_graph.x.shape[1],
+                                                  edge_in=ck_edge_in)
+                            m.load_state_dict(state)
+                            res = eval_egraphsage(m, test_graph, device=device,
+                                                  use_quantile=use_q)
+                            test_scores = res["y_score"].astype(np.float32)
+                            test_labels = res["y_true"]
+                            val_scores, val_labels = vs_standard, vl_standard
+                        except Exception as e:
+                            log.warning(f"  Failed: {e}")
+                            continue
                 else:
                     test_scores = inf_data["scores"]
                     test_labels = inf_data["labels"]
