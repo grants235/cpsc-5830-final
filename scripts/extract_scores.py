@@ -481,10 +481,17 @@ def process_main(ckpt_path, info, dev, device):
         log.warning(f"  Unknown arch: {ckpt_path.name}")
         del sd; return None
 
-    # Temporal models need subgraph extraction — delegate to dedicated handler
-    if arch in ("ts_gib", "ts_sage"):
+    # Temporal models need subgraph extraction — delegate to dedicated handler.
+    # EdgeAwareSAGE (E1.C etc.) has the same key structure as TemporalEdgeSAGE
+    # (both have edge_enc + norm1), so guard with the method name: only E8/E9/
+    # E12/E13 are genuine temporal experiments.
+    _TEMPORAL_PREFIXES = {"E8", "E9", "E12", "E13"}
+    _is_temporal = info["method"].split(".")[0] in _TEMPORAL_PREFIXES
+    if arch in ("ts_gib", "ts_sage") and _is_temporal:
         del sd
         return process_temporal(ckpt_path, info, dev, device)
+    if arch in ("ts_gib", "ts_sage") and not _is_temporal:
+        arch = "sage"   # misdetected — treat as standard EdgeAwareSAGE
 
     method    = info["method"]
     test_fold = info["test_fold"]

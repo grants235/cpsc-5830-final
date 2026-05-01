@@ -348,8 +348,8 @@ def _ensemble_majority(val_scores, val_labels, test_scores, test_labels, p_src):
     P  = float(val_labels.sum())
     N_ = float(len(val_labels)) - P
     if P > 0 and N_ > 0:
-        TPR = float(((val_scores >= 0.5).astype(int) == 1) & (val_labels == 1)).sum() / (P + 1e-8)
-        FPR = float(((val_scores >= 0.5).astype(int) == 1) & (val_labels == 0)).sum() / (N_ + 1e-8)
+        TPR = float((((val_scores >= 0.5).astype(int) == 1) & (val_labels == 1)).sum()) / (P + 1e-8)
+        FPR = float((((val_scores >= 0.5).astype(int) == 1) & (val_labels == 0)).sum()) / (N_ + 1e-8)
         q_t = float((test_scores >= 0.5).mean())
         denom = TPR - FPR
         pi_hat = float(np.clip((q_t - FPR) / denom, 0.01, 0.99)) if abs(denom) >= 0.05 else p_src
