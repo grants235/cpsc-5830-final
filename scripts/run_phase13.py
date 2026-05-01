@@ -224,17 +224,25 @@ def _val_scores_standard(ckpt_path: Path, fold: dict, seed: int,
     ei = combined.edge_index.to(device)
     ea = (combined.edge_attr_q if use_quantile else combined.edge_attr).to(device)
 
+    # Read dims from checkpoint — avoids mismatch when graph features are wider
+    # than what the model was trained with (e.g. nofeat models have edge_in=1).
+    ck_key = "encoder.edge_enc.0.weight" if "encoder.edge_enc.0.weight" in state else "edge_enc.0.weight"
+    ck_edge_in = state[ck_key].shape[1]
+    ck_node_in = combined.x.shape[1]   # node features are always structural, no mismatch
+
+    if ea.shape[1] != ck_edge_in:
+        # Pad or crop graph edge features to match checkpoint's expected edge_in
+        if ea.shape[1] < ck_edge_in:
+            pad = torch.zeros(ea.shape[0], ck_edge_in - ea.shape[1], device=ea.device)
+            ea  = torch.cat([ea, pad], dim=1)
+        else:
+            ea = ea[:, :ck_edge_in]
+
     if is_gib:
-        model = GIB_EGraphSAGE(
-            node_in=combined.x.shape[1],
-            edge_in=ea.shape[1],
-        )
+        model = GIB_EGraphSAGE(node_in=ck_node_in, edge_in=ck_edge_in)
     else:
         from src.models.egraphsage import EdgeAwareSAGE
-        model = EdgeAwareSAGE(
-            node_in=combined.x.shape[1],
-            edge_in=ea.shape[1],
-        )
+        model = EdgeAwareSAGE(node_in=ck_node_in, edge_in=ck_edge_in)
     model.load_state_dict(state)
     model.eval().to(device)
 
