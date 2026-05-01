@@ -147,6 +147,11 @@ def _val_scores_temporal(ckpt_path: Path, fold: dict, seed: int,
     model.load_state_dict(state)
     model.eval().to(device)
 
+    # E12.2/E12.4 models need q_edge_in=2; if no anomaly scores were supplied
+    # fall back to zeros so the shape matches (mirrors extract_scores.py fallback).
+    if q_edge_in == 2 and anomaly_scores_train is None:
+        anomaly_scores_train = np.zeros(len(labels_np), dtype=np.float32)
+
     src_np, dst_np, time_np = _graph_arrays(combined)
     du = _delta_us(DELTA_SECS)
 
