@@ -65,7 +65,7 @@ from src.utils.seeding import seed_everything
 from src.utils.metrics import compute_all_metrics, compute_mcc
 from src.data.graph_builder import load_graph, combine_graphs
 from src.data.temporal_subgraph import batch_build_subgraphs
-from src.models.temporal_gnn import TS_GIB
+from src.models.temporal_gnn import TS_GIB, TemporalEdgeSAGE
 from src.models.gib_egraphsage import GIB_EGraphSAGE
 from src.train.train_loops import _class_weights
 from src.train.eval import eval_egraphsage
@@ -137,20 +137,30 @@ def _val_scores_temporal(ckpt_path: Path, fold: dict, seed: int,
     labels_np = combined.edge_label.numpy()
     vi = _reproduce_val_split_p12(labels_np, seed)
 
-    # Build model from state dict (detect shape from saved keys)
-    state = torch.load(ckpt_path, weights_only=True)
-    # Infer q_edge_in from q_enc vs ctx_enc presence
-    has_q_enc = any(k.startswith("q_enc.") for k in state)
-    q_edge_in = 2 if has_q_enc else 1
-    model = TS_GIB(node_in=NODE_FEAT_DIM, ctx_edge_in=1, q_edge_in=q_edge_in,
-                   hidden=128, use_bottleneck=True, num_domains=0)
+    # Build model from state dict — detect TS_GIB vs TemporalEdgeSAGE by keys.
+    state    = torch.load(ckpt_path, weights_only=True)
+    is_ts_gib = "ctx_enc.0.weight" in state
+
+    if is_ts_gib:
+        has_q_enc = any(k.startswith("q_enc.") for k in state)
+        q_edge_in = 2 if has_q_enc else 1
+        use_bn    = "to_dist.weight" in state
+        dom_w     = state.get("domain_head.2.weight")
+        num_doms  = dom_w.shape[0] if dom_w is not None else 0
+        model     = TS_GIB(node_in=NODE_FEAT_DIM, ctx_edge_in=1, q_edge_in=q_edge_in,
+                           hidden=128, use_bottleneck=use_bn, num_domains=num_doms)
+        # E12.2/E12.4 need q_edge_in=2; fall back to zeros when no scores supplied.
+        if q_edge_in == 2 and anomaly_scores_train is None:
+            anomaly_scores_train = np.zeros(len(labels_np), dtype=np.float32)
+    else:  # TemporalEdgeSAGE (E8.x / E9.x)
+        edge_in   = state["edge_enc.0.weight"].shape[1]
+        hidden    = state["edge_enc.0.weight"].shape[0]
+        node_in   = state["conv1.lin_l.weight"].shape[1] - hidden
+        q_edge_in = edge_in
+        model     = TemporalEdgeSAGE(node_in=node_in, edge_in=edge_in, hidden=hidden)
+
     model.load_state_dict(state)
     model.eval().to(device)
-
-    # E12.2/E12.4 models need q_edge_in=2; if no anomaly scores were supplied
-    # fall back to zeros so the shape matches (mirrors extract_scores.py fallback).
-    if q_edge_in == 2 and anomaly_scores_train is None:
-        anomaly_scores_train = np.zeros(len(labels_np), dtype=np.float32)
 
     src_np, dst_np, time_np = _graph_arrays(combined)
     du = _delta_us(DELTA_SECS)
@@ -165,7 +175,8 @@ def _val_scores_temporal(ckpt_path: Path, fold: dict, seed: int,
             delta_us=du, max_edges=MAX_SUB_EDGES,
             node_feat_dim=NODE_FEAT_DIM, seed=seed, n_jobs=N_JOBS,
         )
-        logits, _ = _ts_gib_forward_batch(model, data_list, q_ea, device)
+        out = _ts_gib_forward_batch(model, data_list, q_ea, device)
+        logits = out[0] if isinstance(out, tuple) else out
         probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
         all_scores.append(probs)
 
