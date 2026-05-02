@@ -1,0 +1,6 @@
+/data/
+data.zip
+__pycache__/
+spex*.md
+.venv/
+*.pt
