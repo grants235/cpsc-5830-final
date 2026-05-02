@@ -915,9 +915,9 @@ def run_task5(seeds=None, dev=True):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_task6(seeds=None):
-    """Print reported MCC (threshold=0.5) vs calibrated MCC for all headline models."""
+    """Print reported MCC (threshold=0.5) vs best calibrated MCC per fold from cal_v2.csv."""
     log.info(f"\n{'='*65}")
-    log.info("Task 6 — Reported MCC at threshold=0.5 vs Calibrated MCC")
+    log.info("Task 6 — Reported MCC at threshold=0.5 vs Best Calibrated MCC")
     log.info(f"{'='*65}")
 
     seeds = seeds or list(range(3))
@@ -938,6 +938,12 @@ def run_task6(seeds=None):
     FOLD_NAMES = ["lycos_ids2017", "cic_ids2018", "unsw_nb15", "ton_iot"]
     FOLD_ABBR  = ["lycos", "cic18", "unsw", "ton"]
 
+    CAL_METHODS_V2 = [
+        "p11_topk_src_rate", "p11_otsu", "p11_gmm",
+        "p11_topk_10pct", "p11_topk_20pct", "p11_topk_30pct",
+        "val_anchor", "znorm_val", "platt", "bbse", "gmm_logit", "ensemble",
+    ]
+
     data: dict = {}
     with open(results_path) as f:
         for row in csv.DictReader(f):
@@ -952,8 +958,34 @@ def run_task6(seeds=None):
         vals = data.get((eid, td, metric), [])
         return np.mean(vals) if vals else float("nan")
 
+    # Load calibration_v2.csv: (exp_id, test_fold, method) → [mcc per seed]
+    cal2: dict = {}
+    if CAL_V2_CSV.exists():
+        with open(CAL_V2_CSV) as f:
+            for row in csv.DictReader(f):
+                for m in CAL_METHODS_V2:
+                    try:
+                        v = float(row.get(m, "nan"))
+                        if not np.isnan(v):
+                            cal2.setdefault((row["experiment_id"], row["test_fold"], m), []).append(v)
+                    except (ValueError, TypeError):
+                        pass
+    else:
+        log.warning("  calibration_v2.csv not found — best-calibrated column will be empty.")
+
+    def _get_best_cal(eid, td):
+        """Best mean-across-seeds MCC over all calibration methods for (eid, td)."""
+        best_v, best_m = float("nan"), ""
+        for m in CAL_METHODS_V2:
+            vals = cal2.get((eid, td, m), [])
+            if vals:
+                mv = float(np.mean(vals))
+                if np.isnan(best_v) or mv > best_v:
+                    best_v, best_m = mv, m
+        return best_v, best_m
+
     log.info(f"\n  Reported MCC (threshold=0.5):")
-    log.info(f"  {'Method':<38}" + "".join(f"  {a:>8}" for a in FOLD_ABBR) + "  {'mean3f':>8}")
+    log.info(f"  {'Method':<38}" + "".join(f"  {a:>8}" for a in FOLD_ABBR) + "  mean3f")
     for label, eid in ROWS:
         vals = [_get(eid, td, "mcc") for td in FOLD_NAMES]
         non_ton = [v for v, td in zip(vals, FOLD_NAMES) if td != "ton_iot" and not np.isnan(v)]
@@ -963,16 +995,23 @@ def run_task6(seeds=None):
         row_s += f"  {mean3:>8.3f}" if not np.isnan(mean3) else f"  {'---':>8}"
         log.info(row_s)
 
-    log.info(f"\n  Calibrated MCC (topk at p_src rate):")
-    log.info(f"  {'Method':<38}" + "".join(f"  {a:>8}" for a in FOLD_ABBR) + "  {'mean3f':>8}")
+    log.info(f"\n  Best Calibrated MCC (per-fold winner across all methods in cal_v2.csv):")
+    log.info(f"  {'Method':<38}" + "".join(f"  {a:>8}" for a in FOLD_ABBR) + "  mean3f")
     for label, eid in ROWS:
-        vals = [_get(eid, td, "calibrated_mcc") for td in FOLD_NAMES]
+        fold_results = [_get_best_cal(eid, td) for td in FOLD_NAMES]
+        vals    = [v for v, _ in fold_results]
+        winners = [m for _, m in fold_results]
         non_ton = [v for v, td in zip(vals, FOLD_NAMES) if td != "ton_iot" and not np.isnan(v)]
         mean3 = np.mean(non_ton) if non_ton else float("nan")
         row_s = f"  {label:<38}" + "".join(
             f"  {v:>8.3f}" if not np.isnan(v) else f"  {'---':>8}" for v in vals)
         row_s += f"  {mean3:>8.3f}" if not np.isnan(mean3) else f"  {'---':>8}"
         log.info(row_s)
+        if any(winners):
+            win_str = "  ".join(
+                f"{abbr}:{w}" for abbr, w in zip(FOLD_ABBR, winners) if w
+            )
+            log.info(f"    ↳ {win_str}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
